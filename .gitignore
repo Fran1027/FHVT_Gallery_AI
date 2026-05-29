@@ -6,13 +6,9 @@ venv/
 .venv/
 .env
 
-# PyInstaller / Nuitka / Compilación
+# PyInstaller / Compilación
 dist/
 build/
-dist_nuitka/
-main.build/
-main.dist/
-main.onefile-build/
 *.spec
 
 # IA / Modelos (Suelen ser pesados, mejor no subirlos al repo)
