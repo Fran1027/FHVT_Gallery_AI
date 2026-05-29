@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.env
+
+# PyInstaller / Nuitka / Compilación
+dist/
+build/
+dist_nuitka/
+main.build/
+main.dist/
+main.onefile-build/
+*.spec
+
+# IA / Modelos (Suelen ser pesados, mejor no subirlos al repo)
+models/
+*.onnx
+*.pth
+
+# Logs y OS
+logs/
+*.log
+.DS_Store
+Thumbs.db
