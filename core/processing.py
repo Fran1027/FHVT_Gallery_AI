@@ -3,11 +3,20 @@ import cv2
 from PyQt6.QtGui import QImage, QPixmap, QTransform, QPainter
 from PyQt6.QtCore import QRect
 
-def apply_image_transformations(base_pix: QPixmap, 
-                                brightness: float, contrast: float, 
-                                angle: int, flip_h: bool, flip_v: bool, 
-                                canvas_L: int, canvas_T: int, canvas_R: int, canvas_B: int, 
-                                canvas_bg_color) -> tuple[QPixmap, 'QRect']:
+
+def apply_image_transformations(
+    base_pix: QPixmap,
+    brightness: float,
+    contrast: float,
+    angle: int,
+    flip_h: bool,
+    flip_v: bool,
+    canvas_L: int,
+    canvas_T: int,
+    canvas_R: int,
+    canvas_B: int,
+    canvas_bg_color,
+) -> tuple[QPixmap, "QRect"]:
     """
     Aplica de manera secuencial y optimizada todas las transformaciones a un QPixmap.
     Retorna el (nuevo_pixmap, rect_del_contenido_visual).
@@ -17,26 +26,28 @@ def apply_image_transformations(base_pix: QPixmap,
         qimg = base_pix.toImage().convertToFormat(QImage.Format.Format_RGB888)
         ptr = qimg.bits()
         ptr.setsize(qimg.sizeInBytes())
-        
+
         h, w, bpl = qimg.height(), qimg.width(), qimg.bytesPerLine()
         arr = np.frombuffer(ptr, np.uint8).reshape((h, bpl))
-        arr = arr[:, :w * 3].reshape((h, w, 3)).copy()
-        
+        arr = arr[:, : w * 3].reshape((h, w, 3)).copy()
+
         # El contraste multiplica (alpha), el brillo suma (beta).
         # Pivotamos sobre 128 (Gris Medio)
         alpha = contrast
         beta = (brightness - 1.0) * 128 + 128 * (1.0 - alpha)
-        
+
         # cv2 procesa esto ultra-rápido en C++
         arr = cv2.convertScaleAbs(arr, alpha=alpha, beta=beta)
-        base_pix = QPixmap.fromImage(QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888))
+        base_pix = QPixmap.fromImage(
+            QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888)
+        )
 
     # 2. Transformación Geométrica (Rotación / Espejo)
     transform = QTransform()
-    if flip_h or flip_v: 
+    if flip_h or flip_v:
         transform.scale(-1 if flip_h else 1, -1 if flip_v else 1)
     transform.rotate(angle)
-    
+
     content_pix = base_pix.transformed(transform)
     content_rect = content_pix.rect()
 

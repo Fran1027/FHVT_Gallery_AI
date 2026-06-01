@@ -2,6 +2,7 @@ from PyQt6.QtWidgets import QHBoxLayout
 from qfluentwidgets import FlyoutViewBase
 from .factory import make_icon_btn
 
+
 class MirrorTool(FlyoutViewBase):
     def __init__(self, on_flip_h, on_flip_v, parent=None):
         super().__init__(parent)
@@ -17,5 +18,7 @@ class MirrorTool(FlyoutViewBase):
         ]
 
         for tooltip, rotation, callback in button_configs:
-            btn = make_icon_btn("flip.png", tooltip, rotation=rotation, callback=callback)
+            btn = make_icon_btn(
+                "flip.png", tooltip, rotation=rotation, callback=callback
+            )
             layout.addWidget(btn)
