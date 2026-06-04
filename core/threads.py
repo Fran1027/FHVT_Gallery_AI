@@ -273,7 +273,7 @@ class PaletteWorker(QObject):
 
 
 class AIWorker(QObject):
-    result_ready = pyqtSignal(QImage)
+    result_ready = pyqtSignal(object)
     finished = pyqtSignal()
     progress = pyqtSignal(int, int)
     error = pyqtSignal(str)
@@ -314,12 +314,20 @@ class AIWorker(QObject):
                 result_rgba = self._process_depth(img_rgba, model_full_path)
             elif self.mode == "normal":
                 result_rgba = self._process_normal(img_rgba, model_full_path)
+            elif self.mode == "sam_encode":
+                result_rgba = self._process_sam_encode(img_rgba, model_full_path)
             elif self.mode == "upscale" or self.mode == "restore":
                 result_rgba = self._process_upscale_tiled(img_rgba, model_full_path)
             else:
                 result_rgba = None
 
             self.progress.emit(100, 100)
+
+            # Si es SAM, devolvemos el tensor directamente
+            if self.mode == "sam_encode":
+                self.result_ready.emit(result_rgba)
+                self.finished.emit()
+                return
 
             if result_rgba is not None:
                 bgra = cv2.cvtColor(result_rgba, cv2.COLOR_RGBA2BGRA)
@@ -520,17 +528,24 @@ class AIWorker(QObject):
         # MoGe ViTS requiere input_tokens, lo calculamos para el tamaño de 518 (patch de 14x14)
         num_tokens = np.array(1369, dtype=np.int64) # (518 // 14) * (518 // 14) = 37 * 37 = 1369
         
-        output = session.run(None, {
+        out_names = [o.name for o in session.get_outputs()]
+        outputs = session.run(None, {
             "image": tensor,
             "num_tokens": num_tokens
         })
         
-        # El output de mapas normales en MoGe está en el índice 1 y su shape es (1, H, W, 3)
-        normals = output[1][0] # Extraemos el batch, quedando (H, W, 3)
+        # Buscamos dinámicamente el output que contenga 'normal' en el nombre
+        normal_idx = next((i for i, name in enumerate(out_names) if 'normal' in name.lower()), 1)
+        normals = outputs[normal_idx][0]
         
         # Si quedó como (3, H, W), lo pasamos a (H, W, 3) por seguridad
         if normals.shape[0] == 3 and normals.shape[2] != 3:
             normals = np.transpose(normals, (1, 2, 0))
+            
+        # --- CORRECCIÓN DE ESPACIO DE COORDENADAS ---
+        # Convertimos de OpenCV a Tangent Space (OpenGL - Estándar Unity/Blender)
+        normals[:, :, 1] = -normals[:, :, 1]  # Invertimos Y (Verde)
+        normals[:, :, 2] = -normals[:, :, 2]  # Invertimos Z (Azul - CRÍTICO)
         
         # Escalar de [-1, 1] a [0, 255]
         normals = np.clip(normals, -1.0, 1.0)
@@ -548,6 +563,24 @@ class AIWorker(QObject):
             alpha_channel = np.full((h, w), 255, dtype=np.uint8)
             
         return np.dstack((normals_resized, alpha_channel))
+
+    def _process_sam_encode(self, img_rgba, model_path):
+        """Calcula el embedding de MobileSAM usando el Encoder (corre una vez)."""
+        session = _load_model(model_path)
+        
+        # MobileSAM espera 1024x1024
+        img_resized = cv2.resize(
+            img_rgba[:, :, :3], (1024, 1024), interpolation=cv2.INTER_CUBIC
+        )
+
+        self.progress.emit(50, 100)
+
+        img_input = img_resized.astype(np.float32)
+        
+        output = session.run(None, {"input_image": img_input})
+        embedding = output[0] # (1, 256, 64, 64)
+        
+        return embedding
 
     def _process_upscale_tiled(
         self, img_rgba, model_path, force_fixed_dim=None, force_batch_size=1

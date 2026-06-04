@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QColorDialog,
     QScrollArea,
     QGridLayout,
+    QGraphicsView,
 )
 from PyQt6.QtGui import QPixmap, QFont, QImage, QPainter, QColor, QUndoStack
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRect
@@ -191,6 +192,7 @@ class EditorState(Enum):
 # ==============================================================================
 class ImageTab(QWidget):
     imageUpdated = pyqtSignal()
+    navigateRequested = pyqtSignal(str)  # "prev" o "next"
 
     STYLE_DEFAULT = "QPushButton { background: transparent; border: 1px solid #fff; border-radius: 6px; color: #ccc; } QPushButton:disabled { color: #444; border-color: #2a2a2a; } QPushButton:hover:enabled { background: rgba(255,255,255,0.1); }"
     STYLE_ACTIVE = "QPushButton { background: #007acc; border: 1px solid #007acc; border-radius: 6px; color: white; } QPushButton:disabled { background: #1a1a1a; color: #444; border-color: #2a2a2a; }"
@@ -239,7 +241,9 @@ class ImageTab(QWidget):
         self.toolbar_layout.setContentsMargins(10, 5, 10, 5)
         self.toolbar_layout.setSpacing(6)
 
-        icon_font = QFont("Segoe MDL2 Assets", 14)
+        icon_font = QFont()
+        icon_font.setFamilies(["Segoe Fluent Icons", "Segoe MDL2 Assets"])
+        icon_font.setPointSize(14)
         self.btn_fullscreen = make_btn(
             "\ue740", "Pantalla Completa", icon_font, self.open_fullscreen
         )
@@ -282,11 +286,6 @@ class ImageTab(QWidget):
         self.btn_cancel = make_btn(
             "\ue711", "Cancelar Todo", icon_font, self.cancel_edits_prompt
         )
-        self.btn_save = make_btn(
-            "\ue74e", "Guardar Imagen", icon_font, self.save_overwrite
-        )
-        self.btn_save.setVisible(False)
-
         # Definir grupos lógicos una sola vez
         self.toolbar_btns = [
             self.btn_fullscreen,
@@ -303,7 +302,6 @@ class ImageTab(QWidget):
             self.btn_undo,
             self.btn_redo,
             self.btn_cancel,
-            self.btn_save,
         ]
         self.edit_mode_btns = [
             self.btn_mirror,
@@ -315,13 +313,35 @@ class ImageTab(QWidget):
             self.btn_ai,
             self.btn_generative,
             self.btn_eraser,
-            self.btn_save,
             self.btn_redo,
         ]
 
         for b in self.toolbar_btns:
             self.toolbar_layout.addWidget(b)
         self.toolbar_layout.addStretch()
+
+        from PyQt6.QtWidgets import QMenu
+        self.btn_save_main = QPushButton(" Guardar ")
+        self.btn_save_main.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.btn_save_main.setStyleSheet("""
+            QPushButton { background-color: #007acc; color: white; border-radius: 6px; padding: 6px 16px; }
+            QPushButton:hover:enabled { background-color: #0098ff; }
+            QPushButton:disabled { background-color: #1a1a1a; color: #555; }
+            QPushButton::menu-indicator { image: none; width: 0px; }
+        """)
+        self.save_menu = QMenu(self)
+        self.save_menu.setStyleSheet("QMenu { background-color: #2b2b2b; color: white; border: 1px solid #444; border-radius: 4px;} QMenu::item { padding: 8px 20px; } QMenu::item:selected { background-color: #007acc; }")
+        
+        act_overwrite = self.save_menu.addAction("💾 Sobrescribir Original")
+        act_overwrite.triggered.connect(self.save_overwrite)
+        
+        act_save_as = self.save_menu.addAction("📄 Guardar Copia Nueva...")
+        act_save_as.triggered.connect(self.save_as_copy)
+        
+        self.btn_save_main.setMenu(self.save_menu)
+        self.btn_save_main.setEnabled(False)
+        self.toolbar_layout.addWidget(self.btn_save_main)
+
         layout.addWidget(self.toolbar_container)
 
         # Adjust Panel
@@ -415,9 +435,18 @@ class ImageTab(QWidget):
             "background-color: #d83b01; color: white; border-radius: 5px; padding: 8px 15px;"
         )
 
+        self.btn_ai_undo = QPushButton("↩️  Deshacer Clic")
+        self.btn_ai_undo.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.btn_ai_undo.setStyleSheet(
+            "background-color: #555555; color: white; border-radius: 5px; padding: 8px 15px;"
+        )
+        self.btn_ai_undo.setVisible(False)
+
+        self.ai_confirm_layout.addWidget(self.btn_ai_undo)
         self.ai_confirm_layout.addWidget(self.btn_ai_save)
         self.ai_confirm_layout.addWidget(self.btn_ai_discard)
 
+        self.btn_ai_undo.clicked.connect(self._undo_ai_click)
         self.btn_ai_save.clicked.connect(self._save_ai_result)
         self.btn_ai_discard.clicked.connect(self._discard_ai_result)
 
@@ -648,11 +677,11 @@ class ImageTab(QWidget):
 
         if state == EditorState.MAIN:
             self.btn_edit.setStyleSheet(self.STYLE_DEFAULT)
-            for b in [self.btn_undo, self.btn_redo, self.btn_cancel, self.btn_save]:
+            for b in [self.btn_undo, self.btn_redo, self.btn_cancel]:
                 b.setVisible(False)
         else:
             self.btn_edit.setStyleSheet(self.STYLE_ACTIVE)
-            for b in [self.btn_undo, self.btn_redo, self.btn_cancel, self.btn_save]:
+            for b in [self.btn_undo, self.btn_redo, self.btn_cancel]:
                 b.setVisible(True)
             if state in [EditorState.EDIT_ADJUST, EditorState.EDIT_ROTATE]:
                 self._create_proxy_pixmap()
@@ -669,7 +698,6 @@ class ImageTab(QWidget):
             EditorState.EDIT_CANVAS: (self.btn_canvas, []),
             EditorState.EDIT_AI: (self.btn_ai, []),
             EditorState.EDIT_MAGIC_ERASER: (self.btn_eraser, []),
-            EditorState.EDIT_SAVE: (self.btn_save, []),
         }
         if state in active_map:
             btn, show_containers = active_map[state]
@@ -804,6 +832,7 @@ class ImageTab(QWidget):
             on_run_restore=self.run_ai_restore,
             on_run_depth=self.run_ai_depth,
             on_run_normal=self.run_ai_normal,
+            on_run_sam=self.run_ai_sam,
         )
         dialog = AIAdvancedDialog(actions, self)
         dialog.exec()
@@ -1030,6 +1059,9 @@ class ImageTab(QWidget):
     def run_ai_normal(self, model_rel_path):
         self._start_ai_worker("normal", "Estimando Mapa de Normales...", model_rel_path)
 
+    def run_ai_sam(self, model_rel_path):
+        self._start_ai_worker("sam_encode", "Preparando Extracción Interactiva...", model_rel_path)
+
     @log_action("Ejecutando Proceso de IA")
     def _start_ai_worker(self, mode, text, model_rel_path):
         if self.original_pixmap.isNull():
@@ -1201,16 +1233,46 @@ class ImageTab(QWidget):
             else:
                 QMessageBox.critical(self, "Error", "No se pudo guardar la imagen.")
 
-    def on_ai_finished(self, qimage):
+    def on_ai_finished(self, result):
+        import numpy as np
+        
         self.viewer.setProgress(100, 100)
         self._cleanup_ai()
 
+        if isinstance(result, np.ndarray) and getattr(self, "current_ai_mode", "") == "sam_encode":
+            from tools.sam_tool import SAMTool
+            self.sam_tool = SAMTool(self.viewer, result, self.original_pixmap)
+            self.viewer.scene.addItem(self.sam_tool)
+            self.viewer.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self._set_toolbar_enabled(True)
+            self.viewer.show_ai_processing(False)
+            
+            from qfluentwidgets import InfoBar, InfoBarPosition
+            InfoBar.info(
+                title="Puntero Mágico Listo",
+                content="Haz clic en la imagen (Izq: Agregar, Der: Quitar)",
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+                parent=self
+            )
+            
+            # Mostrar panel de confirmación AI para aceptar o cancelar
+            is_inline_edit = getattr(self, "current_ai_mode", "") in ["rmbg", "sam_encode"]
+            if is_inline_edit:
+                self.btn_ai_save.setText("✅  Aplicar")
+            else:
+                self.btn_ai_save.setText("💾  Guardar Resultado")
+                
+            self.ai_confirm_panel.setVisible(True)
+            return
+
+        qimage = result
         self.ai_result_qimage = qimage
-        if getattr(self, "current_ai_mode", "") == "txt2img":
-            # No hay imagen base original para comparar, solo mostrar el resultado
-            self.viewer.setPixmap(QPixmap.fromImage(qimage))
-        else:
-            # Activar modo de comparación
+        is_inline_edit = getattr(self, "current_ai_mode", "") in ["rmbg", "sam_encode"]
+        
+        if is_inline_edit:
             orig_scaled = self.original_pixmap.scaled(
                 qimage.width(),
                 qimage.height(),
@@ -1218,59 +1280,142 @@ class ImageTab(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             )
             self.viewer.setComparisonMode(orig_scaled, QPixmap.fromImage(qimage))
+            self.btn_ai_save.setText("✅  Aplicar")
+            self.btn_ai_undo.setVisible(getattr(self, "current_ai_mode", "") == "sam_encode")
+            self.ai_confirm_panel.setVisible(True)
+            self._set_toolbar_enabled(False)
+        else:
+            main_win = self.window()
+            if hasattr(main_win, "open_ai_preview_tab"):
+                main_win.open_ai_preview_tab(
+                    qimage,
+                    self.original_pixmap,
+                    self.file_path,
+                    self.current_ai_mode
+                )
 
+    def set_ai_preview_mode(self, result_qimage, original_pixmap, source_file_path, ai_mode):
+        self.ai_result_qimage = result_qimage
+        self.current_ai_mode = ai_mode
+        self.ai_preview_source_path = source_file_path
+        
+        if ai_mode == "txt2img" or original_pixmap.isNull():
+            self.viewer.setPixmap(QPixmap.fromImage(result_qimage))
+        else:
+            orig_scaled = original_pixmap.scaled(
+                result_qimage.width(),
+                result_qimage.height(),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.viewer.setComparisonMode(orig_scaled, QPixmap.fromImage(result_qimage))
+            
+        self.btn_ai_save.setText("💾  Guardar Resultado")
+        self.btn_ai_undo.setVisible(False)
         self.ai_confirm_panel.setVisible(True)
-        self._set_toolbar_enabled(
-            False
-        )  # Mantener bloqueado hasta confirmar o descartar
+        self._set_toolbar_enabled(False)
+        # Nos aseguramos de estar en modo edición
+        self.set_state(EditorState.EDIT_ROOT)
+
+    def _undo_ai_click(self):
+        if hasattr(self, "sam_tool") and self.sam_tool:
+            self.sam_tool.undo_point()
 
     def _save_ai_result(self):
+        is_inline_edit = False
+        if hasattr(self, "sam_tool") and self.sam_tool:
+            self.ai_result_qimage = self.sam_tool.get_result().toImage()
+            self.viewer.scene.removeItem(self.sam_tool)
+            self.sam_tool = None
+            is_inline_edit = True
+            
         if not hasattr(self, "ai_result_qimage"):
             return
 
-        base, ext = os.path.splitext(self.file_path)
-        mode_suffix = getattr(self, "current_ai_mode", "ai")
-        default_path = f"{base}_{mode_suffix}.png"
+        if getattr(self, "current_ai_mode", "") in ["rmbg", "sam_encode"]:
+            is_inline_edit = True
 
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Guardar Resultado de IA",
-            default_path,
-            "PNG (*.png);;JPEG (*.jpg);;WEBP (*.webp)",
-        )
-        if not file_path:
-            return  # Canceló el diálogo
+        temp_to_delete = None
+        if not is_inline_edit:
+            if hasattr(self, "ai_preview_source_path") and self.ai_preview_source_path:
+                base, ext = os.path.splitext(self.ai_preview_source_path)
+                temp_to_delete = self.file_path  # Es el scratch/ai_preview_xxx.png
+            else:
+                base, ext = os.path.splitext(self.file_path)
+                
+            mode_suffix = getattr(self, "current_ai_mode", "ai")
+            default_path = f"{base}_{mode_suffix}.png"
 
-        if self.ai_result_qimage.save(file_path):
-            logger.info(
-                f"IA: Variante guardada con éxito -> {os.path.basename(file_path)}"
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Guardar Resultado de IA",
+                default_path,
+                "PNG (*.png);;JPEG (*.jpg);;WEBP (*.webp)",
             )
+            if not file_path:
+                return  # Canceló el diálogo
 
-            # Cargar como imagen principal y restaurar UI
+            if not self.ai_result_qimage.save(file_path):
+                QMessageBox.critical(
+                    self,
+                    "Error al guardar",
+                    "No se pudo guardar la variante de IA en el disco.",
+                )
+                return
+            
+            logger.info(f"IA: Variante guardada con éxito -> {os.path.basename(file_path)}")
+            self.file_path = file_path
+            self.ai_preview_source_path = None
+
+        # Cargar como imagen principal y restaurar UI
+        if is_inline_edit:
             self._begin_edit("Aplicar Resultado IA", is_destructive=True)
             self.original_pixmap = QPixmap.fromImage(self.ai_result_qimage)
-            self.file_path = file_path
             self._reset_transformation_params()
             self._end_edit()
+        else:
+            self.original_pixmap = QPixmap.fromImage(self.ai_result_qimage)
+            self._reset_transformation_params()
+            self.undo_stack.clear()
 
-            self._discard_ai_result()  # Restaura la UI
-            self.update_image()
-            self.imageUpdated.emit()
+        self._discard_ai_result(is_saving=True)  # Restaura la UI
+        self.update_image()
+        self.imageUpdated.emit()
 
+        if not is_inline_edit:
             # Actualizar título de la pestaña
             main_win = self.window()
             if hasattr(main_win, "tabs"):
                 idx = main_win.tabs.indexOf(self)
                 if idx != -1:
-                    main_win.tabs.setTabText(idx, os.path.basename(file_path))
-        else:
-            QMessageBox.critical(
-                self,
-                "Error al guardar",
-                "No se pudo guardar la variante de IA en el disco.",
-            )
+                    main_win.tabs.setTabText(idx, os.path.basename(self.file_path))
+                    
+            if temp_to_delete and os.path.exists(temp_to_delete):
+                try:
+                    os.remove(temp_to_delete)
+                except Exception:
+                    pass
 
-    def _discard_ai_result(self):
+    def _discard_ai_result(self, is_saving=False):
+        if hasattr(self, "ai_preview_source_path") and self.ai_preview_source_path and not is_saving:
+            main_win = self.window()
+            if hasattr(main_win, "tabs"):
+                idx = main_win.tabs.indexOf(self)
+                if idx != -1:
+                    main_win.close_tab(idx)
+            
+            if os.path.exists(self.file_path):
+                try:
+                    os.remove(self.file_path)
+                except Exception:
+                    pass
+            return
+            
+        if hasattr(self, "sam_tool") and self.sam_tool:
+            self.viewer.scene.removeItem(self.sam_tool)
+            self.sam_tool = None
+            self.viewer.show_ai_processing(False)
+            
         self.ai_confirm_panel.setVisible(False)
         self.viewer.setPixmap(self.original_pixmap)
         self._set_toolbar_enabled(True)
@@ -1322,7 +1467,7 @@ class ImageTab(QWidget):
         if enabled:
             self.update_menu_state()
         else:
-            for b in [self.btn_undo, self.btn_redo, self.btn_cancel, self.btn_save]:
+            for b in [self.btn_undo, self.btn_redo, self.btn_cancel, self.btn_save_main]:
                 b.setEnabled(False)
 
     def _clear_palette_markers(self):
@@ -1463,7 +1608,8 @@ class ImageTab(QWidget):
             self.btn_undo.setEnabled(self.undo_stack.canUndo())
             self.btn_redo.setEnabled(self.undo_stack.canRedo())
             self.btn_cancel.setEnabled(has_history)
-            self.btn_save.setEnabled(has_history)
+            
+        self.btn_save_main.setEnabled(has_history)
 
     # --- MOTOR DE RENDERIZADO (OPEN CV + NUMPY) ---
     def _sync_ui_to_state(self):
@@ -1664,3 +1810,32 @@ class ImageTab(QWidget):
             )
         else:
             self.proxy_pixmap = self.original_pixmap.copy()
+
+    def keyPressEvent(self, event):
+        """Captura atajos de teclado globales para la pestaña."""
+        modifiers = event.modifiers()
+        
+        # Deshacer / Rehacer
+        if modifiers == Qt.KeyboardModifier.ControlModifier:
+            if event.key() == Qt.Key.Key_Z:
+                self.undo_stack.undo()
+                event.accept()
+                return
+            elif event.key() == Qt.Key.Key_Y:
+                self.undo_stack.redo()
+                event.accept()
+                return
+                
+        # Navegación entre imágenes
+        if event.key() == Qt.Key.Key_Left:
+            self.cancel_edits()
+            self.navigateRequested.emit("prev")
+            event.accept()
+            return
+        elif event.key() == Qt.Key.Key_Right:
+            self.cancel_edits()
+            self.navigateRequested.emit("next")
+            event.accept()
+            return
+            
+        super().keyPressEvent(event)

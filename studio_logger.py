@@ -90,10 +90,11 @@ def setup_logger():
     logger.setLevel(logging.DEBUG)
 
     if not logger.handlers:
-        # Handler 1: Consola (Con colores ANSI vivos)
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(LogcatFormatter(use_colors=True))
-        logger.addHandler(console_handler)
+        # Handler 1: Consola (Solo en Desarrollo)
+        if not getattr(sys, "frozen", False):
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(LogcatFormatter(use_colors=True))
+            logger.addHandler(console_handler)
 
         # Handler 2: Archivo Físico (Texto plano limpio para auditoría post-mortem)
         try:

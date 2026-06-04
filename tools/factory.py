@@ -5,9 +5,18 @@ from PyQt6.QtCore import Qt, QSize
 
 from core.utils import get_base_path
 
-# Constante de ruta centralizada para evitar redundancia
+import sys
+
 BASE_DIR = get_base_path()
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+
+# Compatibilidad con PyInstaller >= 5.3 (onedir mode) que mueve 'datas' a '_internal'
+if getattr(sys, "frozen", False) and not os.path.exists(ASSETS_DIR):
+    internal_assets = os.path.join(os.path.dirname(sys.executable), "_internal", "assets")
+    if os.path.exists(internal_assets):
+        ASSETS_DIR = internal_assets
+    elif hasattr(sys, "_MEIPASS"):
+        ASSETS_DIR = os.path.join(sys._MEIPASS, "assets")
 
 # Cache global para no procesar la misma imagen múltiples veces en memoria
 _ICON_CACHE = {}

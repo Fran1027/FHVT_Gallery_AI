@@ -36,8 +36,8 @@ if __name__ == "__main__":
     ]:
         os.makedirs(os.path.join(get_base_path(), folder), exist_ok=True)
 
-    # Aumentar límite de asignación de imágenes
-    QImageReader.setAllocationLimit(1024)  # MB
+    # Elevar el límite de asignación de Qt a 1024 Megabytes para soportar upscaling masivos
+    QImageReader.setAllocationLimit(1024)
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

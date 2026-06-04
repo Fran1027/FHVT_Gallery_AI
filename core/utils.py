@@ -3,7 +3,9 @@ import sys
 
 
 def get_base_path():
-    """Detecta la ruta base de ejecución, compatible con Nuitka/Freeze."""
+    """Detecta la ruta base de ejecución, compatible con Nuitka/Freeze/PyInstaller."""
+    if hasattr(sys, '_MEIPASS'):
+        return sys._MEIPASS
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
