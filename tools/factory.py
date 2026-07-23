@@ -10,7 +10,7 @@ import sys
 BASE_DIR = get_base_path()
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 
-# Compatibilidad con PyInstaller >= 5.3 (onedir mode) que mueve 'datas' a '_internal'
+# Asegurar compatibilidad paths PyInstaller (_internal)
 if getattr(sys, "frozen", False) and not os.path.exists(ASSETS_DIR):
     internal_assets = os.path.join(os.path.dirname(sys.executable), "_internal", "assets")
     if os.path.exists(internal_assets):
@@ -18,14 +18,14 @@ if getattr(sys, "frozen", False) and not os.path.exists(ASSETS_DIR):
     elif hasattr(sys, "_MEIPASS"):
         ASSETS_DIR = os.path.join(sys._MEIPASS, "assets")
 
-# Cache global para no procesar la misma imagen múltiples veces en memoria
+# Utilizar caché global previniendo duplicidades memoria
 _ICON_CACHE = {}
 
 
 def get_styled_pixmap(filename, color=Qt.GlobalColor.white, rotation=0):
     """Carga, rota y colorea un pixmap con sistema de cache inteligente."""
-    # Generamos una clave única basada en el estilo solicitado
-    # Evitamos error con Enums de Qt que tienen .name como string, no como método
+    # Generar token único derivado de estilo
+    # Prevenir colisión métodos Enum Qt
     if hasattr(color, "name") and callable(color.name):
         color_val = color.name()
     else:
@@ -44,13 +44,13 @@ def get_styled_pixmap(filename, color=Qt.GlobalColor.white, rotation=0):
     if pix.isNull():
         return pix
 
-    # 1. Aplicar Rotación si es necesaria
+    # Aplicar rotación CSS
     if rotation != 0:
         pix = pix.transformed(
             QTransform().rotate(rotation), Qt.TransformationMode.SmoothTransformation
         )
 
-    # 2. Aplicar Coloreado (SourceIn) si se especifica un color
+    # Aplicar tintado (SourceIn) si corresponde
     if color is not None:
         styled_pix = QPixmap(pix.size())
         styled_pix.fill(Qt.GlobalColor.transparent)
@@ -61,7 +61,7 @@ def get_styled_pixmap(filename, color=Qt.GlobalColor.white, rotation=0):
         painter.end()
         pix = styled_pix
 
-    # Guardar en cache para futuros usos
+    # Almacenar pixmap en caché
     _ICON_CACHE[cache_key] = pix
     return pix
 

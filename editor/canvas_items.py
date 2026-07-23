@@ -66,7 +66,7 @@ class CropOverlayItem(QGraphicsObject):
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
-        # Fondo oscuro
+        # Aplicar fondo oscuro
         path = QPainterPath()
         path.addRect(self.scene_rect)
         crop_path = QPainterPath()
@@ -78,7 +78,7 @@ class CropOverlayItem(QGraphicsObject):
         painter.setPen(QPen(Qt.GlobalColor.white, 2, Qt.PenStyle.DashLine))
         painter.drawRect(self.crop_rect)
 
-        # Tiradores
+        # Dibujar tiradores
         painter.setPen(QPen(Qt.GlobalColor.black, 1))
         painter.setBrush(QBrush(Qt.GlobalColor.white))
         s = self.handle_size
@@ -87,7 +87,7 @@ class CropOverlayItem(QGraphicsObject):
             (r.left(), r.top()),
             (r.right(), r.top()),
             (r.left(), r.bottom()),
-            (r.right(), r.bottom()),  # Esquinas
+            (r.right(), r.bottom()),  # Dibujar esquinas
             (r.center().x(), r.top()),
             (r.center().x(), r.bottom()),
             (r.left(), r.center().y()),
@@ -99,7 +99,7 @@ class CropOverlayItem(QGraphicsObject):
     def _get_hotzone(self, pos):
         r = self.crop_rect
         m = self.margin
-        # Esquinas
+        # Dibujar esquinas
         if QRectF(r.left() - m, r.top() - m, m * 2, m * 2).contains(pos):
             return "LT"
         if QRectF(r.right() - m, r.top() - m, m * 2, m * 2).contains(pos):
@@ -117,7 +117,7 @@ class CropOverlayItem(QGraphicsObject):
             return "L"
         if QRectF(r.right() - m, r.top() + m, m * 2, r.height() - m * 2).contains(pos):
             return "R"
-        # Centro
+        # Dibujar centro
         if r.adjusted(m, m, -m, -m).contains(pos):
             return "CENTER"
         return None
@@ -176,7 +176,7 @@ class CropOverlayItem(QGraphicsObject):
                 QRectF(self.drag_origin, pos).normalized().intersected(self.scene_rect)
             )
         else:
-            # Redimensionar
+            # Ejecutar redimensionamiento
             left_val, t, right, b = r.left(), r.top(), r.right(), r.bottom()
             if "L" in self.drag_mode:
                 left_val = min(pos.x(), right - self.min_size)

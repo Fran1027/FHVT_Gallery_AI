@@ -33,6 +33,7 @@ from ui.gallery_view import GroupListWidget
 from ui.widgets import ZoomableViewer, FullScreenViewer, DevDiagnosticWidget
 from ui.styles import MAIN_STYLE, CONTEXT_MENU_STYLE
 from editor.image_tab import ImageTab
+from ui.log_console import LogConsoleDialog
 
 
 class ImageGallery(QMainWindow):
@@ -105,6 +106,33 @@ class ImageGallery(QMainWindow):
         if not getattr(sys, 'frozen', False):
             self.dev_diag = DevDiagnosticWidget()
             sb.addPermanentWidget(self.dev_diag)
+            self.update_dev_diag_visibility()
+
+        self.btn_log_console = QPushButton("\ue9f9") # Icono log
+        self.btn_log_console.setFont(QFont("Segoe MDL2 Assets", 12))
+        self.btn_log_console.setToolTip("Consola de Logs")
+        self.btn_log_console.setStyleSheet("background: transparent; color: #aaa; border: none; padding: 2px;")
+        self.btn_log_console.clicked.connect(self.open_log_console)
+        sb.addPermanentWidget(self.btn_log_console)
+
+    def open_log_console(self):
+        from ui.log_console import LogConsoleWindow
+        self.log_console = LogConsoleWindow(self)
+        self.log_console.show()
+
+    def update_dev_diag_visibility(self):
+        if hasattr(self, 'dev_diag'):
+            from PyQt6.QtCore import QSettings
+            settings = QSettings("FHVT_Studio", "ImageEditor")
+            show = settings.value("show_dev_diag", True, type=bool)
+            self.dev_diag.setVisible(show)
+
+    def show_settings_dialog(self):
+        from ui.settings_dialog import SettingsDialog
+        from PyQt6.QtWidgets import QDialog
+        dialog = SettingsDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.update_dev_diag_visibility()
 
     def _rotate_spinner(self):
         self.lbl_spinner.setText(self.spinner_frames[self.spinner_idx])
@@ -138,17 +166,6 @@ class ImageGallery(QMainWindow):
         toolbar_layout.setContentsMargins(15, 10, 15, 10)
         icon_font = QFont("Segoe MDL2 Assets", 14)
 
-        self.btn_open_new_tab = QPushButton("\ue8b9")
-        self.btn_open_new_tab.setToolTip("Abrir en nueva pestaña")
-        self.btn_open_new_tab.clicked.connect(self.open_selected_in_new_tab)
-
-        self.btn_fullscreen = QPushButton("\ue740")
-        self.btn_fullscreen.setToolTip("Pantalla completa")
-        self.btn_fullscreen.clicked.connect(self.fullscreen_preview)
-
-        self.btn_properties = QPushButton("\ue946")
-        self.btn_properties.setToolTip("Propiedades")
-        self.btn_properties.clicked.connect(self.open_windows_properties)
         self.path_edit = QLineEdit()
         self.path_edit.setReadOnly(True)
         self.path_edit.setPlaceholderText("Selecciona una carpeta...")
@@ -178,34 +195,32 @@ class ImageGallery(QMainWindow):
         self.btn_sort.setEnabled(False)
         self.btn_sort_order.setEnabled(False)
         self.btn_group.setEnabled(False)
-        self.btn_open_new_tab.setEnabled(False)
-        self.btn_fullscreen.setEnabled(False)
-        self.btn_properties.setEnabled(False)
 
         self.btn_open_folder = PrimaryPushButton("\ue838")
         self.btn_open_folder.setToolTip("Abrir carpeta")
         self.btn_open_folder.clicked.connect(self.open_folder_dialog)
 
+        self.btn_settings = QPushButton("\ue713") # Gear icon
+        self.btn_settings.setToolTip("Configuración")
+        self.btn_settings.setStyleSheet("QPushButton { border: 1px solid #333; border-radius: 4px; background: transparent; color: #aaa; } QPushButton:hover { color: #fff; background: #333; }")
+        self.btn_settings.clicked.connect(self.show_settings_dialog)
+
         for btn in [
-            self.btn_open_new_tab,
-            self.btn_fullscreen,
-            self.btn_properties,
             self.btn_sort_order,
             self.btn_open_folder,
+            self.btn_settings,
         ]:
             btn.setFont(icon_font)
             btn.setFixedSize(36, 36)
         self.btn_open_folder.setFixedWidth(50)
 
         for w in [
-            self.btn_open_new_tab,
-            self.btn_fullscreen,
-            self.btn_properties,
             self.path_edit,
             self.btn_sort,
             self.btn_sort_order,
             self.btn_group,
             self.btn_open_folder,
+            self.btn_settings,
         ]:
             toolbar_layout.addWidget(w)
         nav_layout.addLayout(toolbar_layout)
@@ -250,6 +265,15 @@ class ImageGallery(QMainWindow):
         width = self.width()
         self.gallery_left_widget.setMinimumWidth(max(250, int(width * 0.18)))
         self.viewer_container.setMinimumWidth(max(450, int(width * 0.42)))
+
+    def closeEvent(self, event):
+        if self.loader_thread and self.loader_thread.isRunning():
+            self.loader_thread.stop()
+            self.loader_thread.wait()
+            
+        event.accept()
+        # Forzar terminación del proceso para matar hilos zombis o watchers en modo dist
+        os._exit(0)
 
     def toggle_sort_order(self):
         sort_name = getattr(self, "current_sort", "Nombre")
@@ -454,9 +478,6 @@ class ImageGallery(QMainWindow):
             self.btn_sort.setEnabled(False)
             self.btn_sort_order.setEnabled(False)
             self.btn_group.setEnabled(False)
-            self.btn_open_new_tab.setEnabled(False)
-            self.btn_fullscreen.setEnabled(False)
-            self.btn_properties.setEnabled(False)
             self._update_status_bar()
             return
 
@@ -580,9 +601,7 @@ class ImageGallery(QMainWindow):
         count = len(indexes)
 
         # Estos botones solo tienen sentido si hay exactamente UNA imagen seleccionada
-        self.btn_open_new_tab.setEnabled(count == 1)
-        self.btn_fullscreen.setEnabled(count == 1)
-        self.btn_properties.setEnabled(count == 1)
+
 
         if count == 1:
             # Una sola imagen: Mostrar vista previa
@@ -611,10 +630,14 @@ class ImageGallery(QMainWindow):
         menu.setStyleSheet(CONTEXT_MENU_STYLE)
 
         act_open = None
+        act_fullscreen = None
+        act_details = None
         if count <= 3:
             act_open = menu.addAction(
                 f"Abrir ({count})" if count > 1 else "Abrir en pestaña"
             )
+            if count == 1:
+                act_fullscreen = menu.addAction("Abrir en pantalla completa")
             menu.addSeparator()
 
         act_copy = menu.addAction("Copiar")
@@ -623,6 +646,9 @@ class ImageGallery(QMainWindow):
         act_rename = menu.addAction("Renombrar")
         act_rename.setEnabled(count == 1)
         act_delete = menu.addAction("Mover a la papelera")
+        if count == 1:
+            menu.addSeparator()
+            act_details = menu.addAction("Detalles")
 
         act_select_all = None
         if count < total_items:
@@ -637,6 +663,12 @@ class ImageGallery(QMainWindow):
         if act_open and action == act_open:
             for idx in indexes:
                 self.on_item_double_clicked(idx)
+        elif act_fullscreen and action == act_fullscreen:
+            self.fullscreen_preview()
+        elif act_details and action == act_details:
+            from ui.details_dialog import DetallesDialog
+            dlg = DetallesDialog(paths[0], self)
+            dlg.exec()
         elif action in [act_copy, act_cut]:
             fm.copy_to_clipboard(paths, move=(action == act_cut))
         elif action == act_rename:
@@ -796,6 +828,55 @@ class ImageGallery(QMainWindow):
                     indexes[0].data(Qt.ItemDataRole.UserRole)["file_path"]
                 )
                 break
+
+    @log_action("Abriendo consola nativa")
+    def open_log_console(self, checked=False):
+        import sys
+        if getattr(sys, "frozen", False):
+            import ctypes
+            import logging
+            from studio_logger import LogcatFormatter, logger
+            
+            kernel32 = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
+            
+            # Intenta crear la consola, retorna falso si ya existe una
+            if kernel32.AllocConsole():
+                sys.stdout = open("CONOUT$", "w", encoding="utf-8")
+                sys.stderr = open("CONOUT$", "w", encoding="utf-8")
+                
+                # Habilitar secuencias ANSI (colores)
+                handle = kernel32.GetStdHandle(-11) # STD_OUTPUT_HANDLE
+                mode = ctypes.c_ulong()
+                kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+                mode.value |= 0x0004 # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                kernel32.SetConsoleMode(handle, mode)
+                
+                # Deshabilitar el botón (X) Cerrar para evitar cierres accidentales del proceso
+                hwnd = kernel32.GetConsoleWindow()
+                if hwnd:
+                    hMenu = user32.GetSystemMenu(hwnd, False)
+                    if hMenu:
+                        user32.RemoveMenu(hMenu, 0xF060, 0x0000) # SC_CLOSE
+                
+                # Enganchar el stream real con colores al logger
+                console_handler = logging.StreamHandler(sys.stdout)
+                console_handler.setFormatter(LogcatFormatter(use_colors=True))
+                logger.addHandler(console_handler)
+                
+                logger.info("Consola Nativa en tiempo real enganchada correctamente.")
+            else:
+                # Si ya está abierta, traerla al frente
+                hwnd = kernel32.GetConsoleWindow()
+                if hwnd:
+                    user32.SetForegroundWindow(hwnd)
+        else:
+            QMessageBox.information(
+                self, "Modo Desarrollo", 
+                "Estás corriendo el código fuente.\n\n"
+                "La consola real ya está activa en tu PowerShell o Terminal de VS Code.\n"
+                "Revisa allí para ver descargas, progreso y logs en tiempo real."
+            )
 
     @log_action("Mostrando vista previa")
     def display_preview(self, path):

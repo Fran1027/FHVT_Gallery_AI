@@ -14,9 +14,62 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QProgressBar,
     QSpinBox,
+    QWidget,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from huggingface_hub import snapshot_download
+import multiprocessing
+import queue
+
+def hf_download_process(repo_id, cache_dir, q):
+    """
+    Se ejecuta en un proceso 100% aislado.
+    Usa una cola (queue) para comunicarse con el hilo principal.
+    """
+    import os
+    from huggingface_hub import snapshot_download
+    from tqdm.auto import tqdm
+    
+    os.environ["HF_HOME"] = cache_dir
+
+    # Inyectar tqdm global en subproceso
+    from huggingface_hub.utils import tqdm as hf_tqdm_class
+    
+    _original_hf_update = hf_tqdm_class.update
+
+    def _custom_hf_update(self, n=1):
+        _original_hf_update(self, n)
+        # Enviar actualizaciones bytes
+        if getattr(self, "unit", "") == "B" and getattr(self, "total", 0):
+            q.put(("PROGRESS", self.desc, self.n, self.total))
+
+    hf_tqdm_class.update = _custom_hf_update
+
+    allow_patterns = [
+        "*.json", "*.txt", "scheduler/*", "text_encoder/*",
+        "tokenizer/*", "unet/*", "vae/*", "feature_extractor/*",
+        "safety_checker/*",
+    ]
+    
+    ignore_patterns = [
+        "*fp16*",         # Ignorar pesos 16-bits
+        "*non_ema*",      # Ignorar pesos non-ema
+        "*.msgpack",      # Ignorar pesos flax
+        "*.ckpt",         # Ignorar checkpoints viejos
+        "*.h5",           # Ignorar pesos keras
+        "*.ot",           # Ignorar pesos rust
+    ]
+    
+    try:
+        snapshot_download(
+            repo_id=repo_id, 
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns
+        )
+        q.put(("SUCCESS", f"Modelo '{repo_id}' descargado con éxito."))
+    except Exception as e:
+        q.put(("ERROR", str(e)))
+
+
 from core.utils import get_base_path
 from core.generative import CaptioningWorker, PromptEnhancerWorker
 
@@ -32,12 +85,12 @@ def is_model_downloaded(repo_id):
             for snapshot in snapshots:
                 snapshot_dir = os.path.join(snapshots_path, snapshot)
                 if os.path.isdir(snapshot_dir):
-                    # Verificar que contenga model_index.json para asegurar que no está incompleto
+                    # Verificar model_index.json
                     if not os.path.exists(
                         os.path.join(snapshot_dir, "model_index.json")
                     ):
                         continue
-                    # Verificar que las carpetas críticas de diffusers no estén vacías
+                    # Verificar carpetas críticas
                     valid = True
                     for subfolder in ["unet", "vae", "text_encoder"]:
                         subfolder_path = os.path.join(snapshot_dir, subfolder)
@@ -54,46 +107,103 @@ def is_model_downloaded(repo_id):
 
 
 class ModelDownloadWorker(QThread):
-    finished = pyqtSignal(bool, str)  # success, message
+    finished = pyqtSignal(bool, str)  # Emitir estado y mensaje
+    progress_updated = pyqtSignal(str, int, int) # Emitir progreso descarga
 
     def __init__(self, repo_id):
         super().__init__()
         self.repo_id = repo_id
+        self.is_cancelled = False
+
+    def cancel(self):
+        self.is_cancelled = True
 
     def run(self):
+        from core.utils import get_base_path
+        import os
+        from huggingface_hub import snapshot_download
+        
+        cache_dir = os.path.join(get_base_path(), "models", "generative", "hf_cache")
+        folder_name = f"models--{self.repo_id.replace('/', '--')}"
+        model_path = os.path.join(cache_dir, folder_name)
+
+        if os.path.exists(model_path) and not is_model_downloaded(self.repo_id):
+            import shutil
+            try:
+                shutil.rmtree(model_path)
+            except Exception:
+                pass
+
+        os.environ["HF_HOME"] = cache_dir
+
+        # Inyectar tqdm global en el mismo proceso para leer progreso y cancelar
+        from huggingface_hub.utils import tqdm as hf_tqdm_class
+        _original_hf_update = hf_tqdm_class.update
+
+        def _custom_hf_update(tqdm_self, n=1):
+            if self.is_cancelled:
+                raise InterruptedError("Descarga cancelada por el usuario.")
+            
+            _original_hf_update(tqdm_self, n)
+            if getattr(tqdm_self, "unit", "") == "B" and getattr(tqdm_self, "total", 0):
+                self.progress_updated.emit(tqdm_self.desc or "Descargando", tqdm_self.n, tqdm_self.total)
+                
+                # Loggear progreso sin spam
+                pct = int((tqdm_self.n / tqdm_self.total) * 100)
+                last_pct = getattr(self, "_last_log_pct", -1)
+                if pct % 10 == 0 and pct != last_pct:
+                    from studio_logger import logger
+                    from core.utils import format_size
+                    logger.info(f"Descargando {tqdm_self.desc}: {pct}% ({format_size(tqdm_self.n)} / {format_size(tqdm_self.total)})")
+                    self._last_log_pct = pct
+
+        hf_tqdm_class.update = _custom_hf_update
+
+        allow_patterns = [
+            "*.json", "*.txt", "scheduler/*", "text_encoder/*",
+            "tokenizer/*", "unet/*", "vae/*", "feature_extractor/*",
+            "safety_checker/*",
+        ]
+        
+        ignore_patterns = [
+            "*fp16*",         # Ignorar pesos 16-bits
+            "*non_ema*",      # Ignorar pesos non-ema
+            "*.msgpack",      # Ignorar pesos flax
+            "*.ckpt",         # Ignorar checkpoints viejos
+            "*.h5",           # Ignorar pesos keras
+            "*.ot",           # Ignorar pesos rust
+        ]
+
+        max_retries = 20
         try:
-            # Si el modelo no está completamente descargado (por ejemplo, falta model_index.json),
-            # pero la carpeta de caché existe, la borramos para forzar una descarga limpia y evitar
-            # que Hugging Face asuma falsamente que la descarga ya está terminada.
-            cache_dir = os.path.join(
-                get_base_path(), "models", "generative", "hf_cache"
-            )
-            folder_name = f"models--{self.repo_id.replace('/', '--')}"
-            model_path = os.path.join(cache_dir, folder_name)
-
-            if os.path.exists(model_path) and not is_model_downloaded(self.repo_id):
-                import shutil
-
+            for attempt in range(max_retries):
                 try:
-                    shutil.rmtree(model_path)
-                except Exception:
-                    pass
-
-            allow_patterns = [
-                "*.json",
-                "*.txt",
-                "scheduler/*",
-                "text_encoder/*",
-                "tokenizer/*",
-                "unet/*",
-                "vae/*",
-                "feature_extractor/*",
-                "safety_checker/*",
-            ]
-            snapshot_download(repo_id=self.repo_id, allow_patterns=allow_patterns)
-            self.finished.emit(True, f"Modelo '{self.repo_id}' descargado con éxito.")
-        except Exception as e:
-            self.finished.emit(False, str(e))
+                    snapshot_download(
+                        repo_id=self.repo_id, 
+                        allow_patterns=allow_patterns,
+                        ignore_patterns=ignore_patterns,
+                        resume_download=True,
+                        max_workers=8
+                    )
+                    if not self.is_cancelled:
+                        self.finished.emit(True, f"Modelo '{self.repo_id}' descargado con éxito.")
+                    break
+                except InterruptedError:
+                    self.finished.emit(False, "Descarga cancelada por el usuario.")
+                    break
+                except Exception as e:
+                    if self.is_cancelled:
+                        break
+                    if attempt < max_retries - 1:
+                        from studio_logger import logger
+                        logger.warning(f"Error de red detectado (Intento {attempt+1}/{max_retries}): {e}. Auto-reanudando...")
+                        import time
+                        time.sleep(2)
+                    else:
+                        self.finished.emit(False, f"Fallo al descargar después de {max_retries} intentos: {str(e)}")
+        finally:
+            # Restaurar tqdm original
+            hf_tqdm_class.update = _original_hf_update
 
 
 class ModelRowWidget(QFrame):
@@ -117,7 +227,7 @@ class ModelRowWidget(QFrame):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(10)
 
-        # Info
+        # Mostrar información
         info_layout = QVBoxLayout()
         info_layout.setSpacing(2)
 
@@ -143,7 +253,7 @@ class ModelRowWidget(QFrame):
 
         layout.addLayout(info_layout, stretch=1)
 
-        # Botón de Acción
+        # Configurar botón acción
         self.btn_action = QPushButton()
         self.btn_action.setFixedWidth(90)
         self.btn_action.setStyleSheet("""
@@ -229,7 +339,7 @@ class GenerativeDialog(QDialog):
         layout.setContentsMargins(25, 20, 25, 20)
         layout.setSpacing(12)
 
-        # 0. Modo de Operación
+        # Configurar modo operación
         layout.addWidget(QLabel("0. Modo de Operación"))
         self.combo_mode = QComboBox()
         self.combo_mode.setMinimumHeight(30)
@@ -237,12 +347,28 @@ class GenerativeDialog(QDialog):
             [
                 "Imagen a Imagen (Transferencia de Estilo)",
                 "Texto a Imagen (Generar desde cero)",
+                "Inpainting Mágico (Auto-Enmascarado por Texto)",
             ]
         )
         self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
         layout.addWidget(self.combo_mode)
+        
+        # Objeto objetivo para Inpainting Mágico
+        self.h_target = QHBoxLayout()
+        self.lbl_target = QLabel("Objeto a Modificar (Inglés recomendado):")
+        self.input_target = QLineEdit()
+        self.input_target.setPlaceholderText("Ej: hat, shirt, face, background...")
+        self.input_target.setMinimumHeight(30)
+        self.h_target.addWidget(self.lbl_target)
+        self.h_target.addWidget(self.input_target)
+        
+        # Contenedor para h_target para poder ocultarlo fácil
+        self.target_container = QWidget()
+        self.target_container.setLayout(self.h_target)
+        self.target_container.hide()
+        layout.addWidget(self.target_container)
 
-        # 1. Base Model
+        # Configurar modelo base
         layout.addWidget(QLabel("1. Modelo Base (Checkpoint)"))
         lbl_info = QLabel(
             "Selecciona un modelo. La tarjeta abajo mostrará sus detalles y estado."
@@ -264,13 +390,13 @@ class GenerativeDialog(QDialog):
 
         layout.addLayout(h_base)
 
-        # Contenedor de la tarjeta del modelo
+        # Crear contenedor tarjeta
         self.model_card_container = QVBoxLayout()
         self.model_card_container.setContentsMargins(0, 2, 0, 8)
         self.current_model_card = None
         layout.addLayout(self.model_card_container)
 
-        # 2. LoRA
+        # Configurar lora
         layout.addWidget(QLabel("2. Estilo a Aplicar (LoRA)"))
         lbl_lora_info = QLabel(
             "Opcional. Selecciona un archivo de estilo local (.safetensors)."
@@ -293,7 +419,7 @@ class GenerativeDialog(QDialog):
         h_lora.addWidget(btn_lora)
         layout.addLayout(h_lora)
 
-        # 2.5. Trigger Word
+        # Configurar trigger word
         h_trigger = QHBoxLayout()
         h_trigger.addWidget(QLabel("Palabra Clave (Trigger):"))
         self.input_trigger = QLineEdit()
@@ -302,7 +428,7 @@ class GenerativeDialog(QDialog):
         h_trigger.addWidget(self.input_trigger)
         layout.addLayout(h_trigger)
 
-        # 3. Denoising Strength
+        # Configurar denoising
         self.lbl_denoising = QLabel("3. Fuerza del Cambio: 50%")
         layout.addWidget(self.lbl_denoising)
         self.slider_denoising = QSlider(Qt.Orientation.Horizontal)
@@ -312,7 +438,7 @@ class GenerativeDialog(QDialog):
         self.slider_denoising.valueChanged.connect(self._on_slider_change)
         layout.addWidget(self.slider_denoising)
 
-        # 3.2. Pasos de Inferencia
+        # Configurar pasos inferencia
         self.lbl_steps = QLabel("Pasos Base (Calidad): 30")
         layout.addWidget(self.lbl_steps)
         self.slider_steps = QSlider(Qt.Orientation.Horizontal)
@@ -322,7 +448,7 @@ class GenerativeDialog(QDialog):
         self.slider_steps.valueChanged.connect(self._update_steps_label)
         layout.addWidget(self.slider_steps)
 
-        # 3.5. Batch Size
+        # Configurar batch size
         h_batch = QHBoxLayout()
         h_batch.addWidget(QLabel("Cantidad de Variaciones (Lote):"))
         self.spin_batch = QSpinBox()
@@ -335,7 +461,7 @@ class GenerativeDialog(QDialog):
         h_batch.addWidget(self.spin_batch)
         layout.addLayout(h_batch)
 
-        # 4. Prompt
+        # Configurar prompt
         layout.addWidget(QLabel("4. Descripción (Prompt)"))
 
         h_prompt = QHBoxLayout()
@@ -364,7 +490,7 @@ class GenerativeDialog(QDialog):
         h_prompt.addWidget(self.btn_auto_prompt)
         layout.addLayout(h_prompt)
 
-        # Downloader Progress Layout
+        # Configurar layout descarga
         self.download_layout = QVBoxLayout()
         self.download_layout.setSpacing(4)
 
@@ -404,12 +530,12 @@ class GenerativeDialog(QDialog):
 
         layout.addStretch()
 
-        # Botones finales
+        # Configurar botones finales
         h_btns = QHBoxLayout()
         btn_cancel = QPushButton("Cancelar")
         btn_cancel.setObjectName("CancelBtn")
         btn_cancel.setMinimumHeight(36)
-        btn_cancel.clicked.connect(self.close)
+        btn_cancel.clicked.connect(self._on_cancel_clicked)
 
         self.btn_exec = QPushButton("Aplicar Estilo")
         self.btn_exec.setObjectName("ExecuteBtn")
@@ -447,15 +573,19 @@ class GenerativeDialog(QDialog):
 
     def _on_mode_changed(self):
         is_img2img = self.combo_mode.currentIndex() == 0
-        self.lbl_denoising.setVisible(is_img2img)
-        self.slider_denoising.setVisible(is_img2img)
-        self.combo_enhance_length.setVisible(not is_img2img)
+        is_txt2img = self.combo_mode.currentIndex() == 1
+        is_inpaint = self.combo_mode.currentIndex() == 2
+        
+        self.lbl_denoising.setVisible(not is_txt2img)
+        self.slider_denoising.setVisible(not is_txt2img)
+        self.combo_enhance_length.setVisible(is_txt2img)
+        self.target_container.setVisible(is_inpaint)
 
-        # El botón de prompt siempre está visible, pero cambia su función/texto
-        if is_img2img:
-            self.btn_auto_prompt.setText("✨ Autocompletar")
-        else:
+        # Actualizar botón prompt
+        if is_txt2img:
             self.btn_auto_prompt.setText("✨ Mejorar Prompt")
+        else:
+            self.btn_auto_prompt.setText("✨ Autocompletar")
 
         self._on_prompt_changed()
         self._update_execute_button()
@@ -651,7 +781,28 @@ class GenerativeDialog(QDialog):
 
         self.download_worker = ModelDownloadWorker(repo_id)
         self.download_worker.finished.connect(self._on_download_finished)
+        self.download_worker.progress_updated.connect(self._update_progress)
         self.download_worker.start()
+
+    def _update_progress(self, desc, downloaded, total):
+        from core.utils import format_size
+        pct = int((downloaded / total) * 100) if total > 0 else 0
+        self.download_progress.setMaximum(100)
+        self.download_progress.setValue(pct)
+        # Mostrar progreso formateado
+        self.lbl_download_status.setText(
+            f"Descargando {desc}... ({format_size(downloaded)} / {format_size(total)})"
+        )
+
+    def _on_cancel_clicked(self):
+        if self.download_worker and self.download_worker.isRunning():
+            self.download_worker.cancel()
+        self.close()
+        
+    def closeEvent(self, event):
+        if self.download_worker and self.download_worker.isRunning():
+            self.download_worker.cancel()
+        super().closeEvent(event)
 
     def _on_download_finished(self, success, message):
         self.lbl_download_status.hide()
@@ -760,8 +911,8 @@ class GenerativeDialog(QDialog):
 
     def _update_steps_label(self):
         base_steps = self.slider_steps.value()
-        is_img2img = self.combo_mode.currentIndex() == 0
-        if is_img2img:
+        is_txt2img = self.combo_mode.currentIndex() == 1
+        if not is_txt2img:
             strength = self.slider_denoising.value() / 100.0
             actual_steps = max(1, int(base_steps * strength))
             self.lbl_steps.setText(
@@ -803,12 +954,14 @@ class GenerativeDialog(QDialog):
         denoising = self.slider_denoising.value() / 100.0
         prompt = self.input_prompt.text().strip()
 
-        # Inyectar trigger de forma inteligente al momento de ejecución
+        # Inyectar trigger inteligente
         trigger = self.input_trigger.text().strip()
         if trigger and trigger not in prompt:
             prompt = f"{trigger}, {prompt}" if prompt else trigger
 
         num_images = self.spin_batch.value()
+
+        target_object = self.input_target.text().strip() if self.combo_mode.currentIndex() == 2 else None
 
         if not lora_path and not prompt:
             QMessageBox.warning(
@@ -817,11 +970,21 @@ class GenerativeDialog(QDialog):
                 "Si no usas un LoRA, debes escribir al menos una descripción (Prompt) para guiar a la IA. De lo contrario, no sabrá qué dibujar.",
             )
             return
+            
+        if self.combo_mode.currentIndex() == 2 and not target_object:
+            QMessageBox.warning(self, "Atención", "Debes especificar qué objeto quieres modificar (ej: hat, face, shirt).")
+            return
 
-        gen_mode = "img2img" if self.combo_mode.currentIndex() == 0 else "txt2img"
+        if self.combo_mode.currentIndex() == 2:
+            gen_mode = "inpaint"
+        elif self.combo_mode.currentIndex() == 0:
+            gen_mode = "img2img"
+        else:
+            gen_mode = "txt2img"
+            
         steps = self.slider_steps.value()
         self.run_callback(
-            gen_mode, base_model_path, lora_path, denoising, prompt, num_images, steps
+            gen_mode, base_model_path, lora_path, denoising, prompt, num_images, steps, target_object
         )
         self.close()
 
@@ -847,7 +1010,7 @@ class GenerativeDialog(QDialog):
             self.enhancer_worker.progress.connect(self.lbl_status.setText)
             self.enhancer_worker.result_ready.connect(self._on_enhance_finished)
             self.enhancer_worker.error.connect(self._on_auto_prompt_error)
-            # Use native finished signal for safe deletion
+            # Borrar worker terminado
             self.enhancer_worker.finished.connect(self.enhancer_worker.deleteLater)
             self.enhancer_worker.start()
             return
@@ -860,12 +1023,12 @@ class GenerativeDialog(QDialog):
         self.caption_worker.progress.connect(self.lbl_status.setText)
         self.caption_worker.result_ready.connect(self._on_auto_prompt_finished)
         self.caption_worker.error.connect(self._on_auto_prompt_error)
-        # Use native finished signal for safe deletion
+        # Borrar worker terminado
         self.caption_worker.finished.connect(self.caption_worker.deleteLater)
         self.caption_worker.start()
 
     def _on_auto_prompt_finished(self, text):
-        # Moondream2 ya es inteligente y describe el estilo, ya no necesitamos hardcodear prefijos.
+        # Procesar texto moondream
         trigger = self.input_trigger.text().strip()
         if trigger:
             final_text = f"{trigger}, {text}"

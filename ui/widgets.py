@@ -562,6 +562,12 @@ class FullScreenViewer(ZoomableViewer):
             self.setPixmap(pix)
         self.showFullScreen()
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
+
 class DevDiagnosticWidget(QWidget):
     """Widget de diagnóstico en tiempo real para entornos de desarrollo."""
 

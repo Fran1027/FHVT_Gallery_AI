@@ -16,7 +16,18 @@ def _load_sam_decoder():
     cfg = MODELS_CONFIG["MobileSAM"]
     base = get_base_path()
     dec_path = os.path.join(base, os.path.dirname(cfg["path"]), cfg["extra_files"][0])
-    
+    if not os.path.exists(dec_path):
+        from huggingface_hub import hf_hub_download
+        import shutil
+        os.makedirs(os.path.dirname(dec_path), exist_ok=True)
+        dec_cache = hf_hub_download(repo_id="PulpCut/mobilesam-onnx", filename="mobilesam.decoder.onnx")
+        shutil.copy2(dec_cache, dec_path)
+        # Also grab encoder to be safe if they only clicked manual tool first
+        enc_path = os.path.join(os.path.dirname(dec_path), "mobilesam.encoder.onnx")
+        if not os.path.exists(enc_path):
+            enc_cache = hf_hub_download(repo_id="PulpCut/mobilesam-onnx", filename="mobilesam.encoder.onnx")
+            shutil.copy2(enc_cache, enc_path)
+
     import onnxruntime as ort
     return ort.InferenceSession(dec_path, providers=['CPUExecutionProvider'])
     
@@ -37,7 +48,7 @@ class SAMTool(QGraphicsObject):
         self.mask_overlay = None
         self.current_mask_alpha = None
         
-        # Cargar decoder
+        # Instanciar ONNX Decoder
         self.dec_sess = _load_sam_decoder()
 
     def boundingRect(self):
@@ -82,7 +93,7 @@ class SAMTool(QGraphicsObject):
         if not self.points:
             return
             
-        # Transformar puntos al sistema 1024x1024
+        # Transformar puntos origen a grilla 1024
         orig_w = self.scene_rect.width()
         orig_h = self.scene_rect.height()
         
@@ -95,7 +106,7 @@ class SAMTool(QGraphicsObject):
         
         lbls = np.array(self.labels, dtype=np.float32)
         
-        # Formatos exactos esperados
+        # Definir inputs de modelo estrictos
         point_coords = pts.reshape(1, len(self.points), 2)
         point_labels = lbls.reshape(1, len(self.labels))
         mask_input = np.zeros((1, 1, 256, 256), dtype=np.float32)
@@ -113,14 +124,14 @@ class SAMTool(QGraphicsObject):
         
         mask = out[0][0, 0, :, :] # (1024, 1024)
         
-        # Redimensionar al original
+        # Ejecutar redimensionamiento al original
         mask_cv = cv2.resize(mask, (int(orig_w), int(orig_h)), interpolation=cv2.INTER_LINEAR)
         
-        # Aplicar umbral > 0 es máscara
+        # Binarizar máscara (umbral > 0)
         mask_cv = (mask_cv > 0.0).astype(np.uint8) * 255
         self.current_mask_alpha = mask_cv
         
-        # Generar QPixmap verde semitransparente para el visor
+        # Generar Overlay QPixmap (Verde Alfa)
         color_mask = np.zeros((int(orig_h), int(orig_w), 4), dtype=np.uint8)
         color_mask[:, :, 0] = 0   # R
         color_mask[:, :, 1] = 255 # G
@@ -141,7 +152,7 @@ class SAMTool(QGraphicsObject):
         ptr.setsize(orig_img.sizeInBytes())
         arr = np.array(ptr, copy=True).reshape((orig_img.height(), orig_img.width(), 4))
         
-        # Aplicar el alpha de la máscara al alpha original
+        # Transferir Alpha de máscara a Alpha objetivo
         arr[:, :, 3] = np.minimum(arr[:, :, 3], self.current_mask_alpha)
         
         bytes_per_line = 4 * orig_img.width()

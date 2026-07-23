@@ -455,7 +455,7 @@ class ModelCard(QFrame):
         main_layout.setContentsMargins(20, 20, 20, 15)
         main_layout.setSpacing(15)
 
-        # CABECERA: Título y estado
+        # Configurar cabecera tarjeta
         v_header = QVBoxLayout()
         v_header.setSpacing(4)
         lbl_mod_tag = QLabel("MODALIDAD:")
@@ -475,11 +475,11 @@ class ModelCard(QFrame):
         v_header.addWidget(status_bar)
         main_layout.addLayout(v_header)
 
-        # CUERPO: Grid Híbrido (Descripción + Specs)
+        # Configurar cuerpo grid tarjeta
         h_body = QHBoxLayout()
         h_body.setSpacing(12)
 
-        # Izquierda: Caja de texto descriptivo
+        # Insertar caja descriptiva izquierda
         desc_box = QFrame()
         desc_box.setStyleSheet(
             "background-color: rgba(25, 25, 25, 0.5); border: 1px solid #252525; border-radius: 12px;"
@@ -499,7 +499,7 @@ class ModelCard(QFrame):
         desc_layout.addStretch()
         h_body.addWidget(desc_box, 1)
 
-        # Derecha: Columna de InfoBoxes
+        # Insertar InfoBoxes derecha
         v_specs = QVBoxLayout()
         v_specs.setSpacing(8)
         v_specs.addWidget(
@@ -512,20 +512,21 @@ class ModelCard(QFrame):
 
         main_layout.addLayout(h_body)
 
-        # FOOTER: Utilidad completa
+        # Configurar footer tarjeta
         lbl_foot = QLabel(config.get("full_utility", ""))
         lbl_foot.setStyleSheet("color: #0098ff; font-size: 10px; font-weight: bold;")
         lbl_foot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(lbl_foot)
 
-        # Estilo Dinámico basado en Propiedades
+        # Aplicar estilo CSS dinámico
         self.setProperty("installed", bool(exists))
         self.setProperty("selected", bool(is_selected))
         self.setStyleSheet(self.STATIC_STYLE)
 
-    def mousePressEvent(self, event):
-        self.clicked.emit(self.name)
-        super().mousePressEvent(event)
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.name)
+        super().mouseReleaseEvent(event)
 
 
 class FilterCapsule(QFrame):
@@ -715,7 +716,7 @@ class AIAdvancedDialog(QDialog):
         filter_util = self.combo_util.currentText().lower()
         filter_vram = self.combo_vram.currentText().split(" ")[0].lower()
 
-        # Ordenar modelos por requisito de VRAM (de menor a mayor)
+        # Ordenar catálogo según VRAM (ascendente)
         def get_vram_mb(cfg):
             v_str = cfg.get("vram", "0 MB")
             return (
@@ -728,7 +729,7 @@ class AIAdvancedDialog(QDialog):
 
         col, row = 0, 0
         for name, cfg in sorted_models:
-            # 1. Filtro por Tipo (Realista/Anime)
+            # Filtrar por tipo artístico
             sub_cat = cfg.get("sub", "universal")
             type_map = {"realista": "real", "anime": "anime"}
             target_type = type_map.get(filter_type)
@@ -751,7 +752,7 @@ class AIAdvancedDialog(QDialog):
             if filter_util != "cualquiera" and cfg["cat"] != target_util:
                 continue
 
-            # 3. Filtro por Requisitos (VRAM Real)
+            # Filtrar por requisitos técnicos VRAM
             if filter_vram != "cualquiera":
                 v_str = cfg["vram"]
                 v_mb = (
@@ -780,6 +781,17 @@ class AIAdvancedDialog(QDialog):
                 row += 1
         self.grid.setRowStretch(row + 1, 1)
 
+    def _update_card_styles(self):
+        """Actualiza los estilos visuales sin destruir la grilla."""
+        for i in range(self.grid.count()):
+            widget = self.grid.itemAt(i).widget()
+            if hasattr(widget, "name"):
+                is_selected = (widget.name == self.selected_model)
+                if widget.property("selected") != is_selected:
+                    widget.setProperty("selected", is_selected)
+                    widget.style().unpolish(widget)
+                    widget.style().polish(widget)
+
     def _on_model_selected(self, name):
         self.selected_model = name
         self.lbl_current.setText(name)
@@ -792,7 +804,7 @@ class AIAdvancedDialog(QDialog):
         self.btn_delete.setEnabled(exists)
         self.btn_execute.setEnabled(exists)
         self.btn_download.setEnabled(not exists)
-        self._request_refresh()
+        self._update_card_styles()
 
     def _deselect_model(self, *args):
         self.selected_model = None
@@ -804,7 +816,7 @@ class AIAdvancedDialog(QDialog):
         self.btn_delete.setEnabled(False)
         self.btn_execute.setEnabled(False)
         self.btn_download.setEnabled(False)
-        self._request_refresh()
+        self._update_card_styles()
 
     @log_action("Borrando Modelo IA")
     def _delete_model(self, *args):
