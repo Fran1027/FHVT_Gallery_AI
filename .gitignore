@@ -1,23 +1,73 @@
-# Python
+# ===============================================================================
+# FHVT STUDIO IMAGE EDITOR - .gitignore (Configuracion Optimizada para GitHub)
+# ===============================================================================
+
+# --- Entornos Virtuales e Interpretes (Instalables via requirements.txt) ---
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Bytecode y Cache de Python ---
 __pycache__/
 *.py[cod]
 *$py.class
-venv/
-.venv/
-.env
+*.egg-info/
+.eggs/
 
-# PyInstaller / Compilación
-dist/
-build/
-*.spec
+# --- Caches de Linters y Testing ---
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
-# IA / Modelos (Suelen ser pesados, mejor no subirlos al repo)
+# --- Modelos de IA y Pesos Binarios (Pesados: Descarga automatica en la app) ---
 models/
 *.onnx
+*.onnx_data
+*.safetensors
 *.pth
+*.pt
+*.bin
+*.ckpt
+*.engine
+*.tflite
 
-# Logs y OS
+# --- Compilacion PyInstaller (El archivo .spec SI se guarda para reproducibilidad) ---
+build/
+dist/
+
+# --- Logs, Perfilado y Volcados Temporales ---
 logs/
 *.log
+*.prof
+*.pstats
+profile_export.txt
+studio_biopsy.log
+archivos.txt
+Get-Process
+
+# --- Carpetas y Archivos Temporales de Scratch ---
+scratch/
+*.tmp
+*.temp
+
+# --- Archivos de Sistema Operativo y Editores IDE ---
+*.lnk
 .DS_Store
 Thumbs.db
+ehthumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Variables de Entorno y Secretos Locales ---
+.env
+.env.local
+.env.*.local

@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QPushButton, QMessageBox
+    QDialog, QVBoxLayout, QHBoxLayout, QCheckBox, QPushButton, QMessageBox
 )
-from PyQt6.QtCore import Qt, QSettings
+from PyQt6.QtCore import QSettings
 from PyQt6.QtGui import QFont
 
 class SettingsDialog(QDialog):

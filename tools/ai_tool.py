@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from huggingface_hub import hf_hub_download
 from studio_logger import log_action, logger
 from core.utils import get_base_path
 
@@ -861,7 +860,7 @@ class AIAdvancedDialog(QDialog):
         self.pbar.setRange(0, 100)
         self.pbar.setValue(0)
         self.pbar.show()
-        self.lbl_msg.setText(f"📥 Conectando...")
+        self.lbl_msg.setText("📥 Conectando...")
         self.worker = DownloadWorker(cfg)
         self.worker.progress.connect(self._on_download_progress)
         self.worker.finished.connect(self._on_download_finished)
@@ -869,7 +868,7 @@ class AIAdvancedDialog(QDialog):
 
     def _cancel_download(self):
         if hasattr(self, 'worker') and self.worker.isRunning():
-            self.lbl_msg.setText(f"⛔ Cancelando...")
+            self.lbl_msg.setText("⛔ Cancelando...")
             self.btn_cancel_download.setEnabled(False)
             self.worker.cancel()
 

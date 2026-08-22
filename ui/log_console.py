@@ -56,7 +56,8 @@ class LogConsoleDialog(QDialog):
                 if lines:
                     for line in lines:
                         line = line.rstrip()
-                        if not line: continue
+                        if not line:
+                            continue
                         
                         match = LOG_PATTERN.match(line)
                         if match:

@@ -17,7 +17,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # Iniciar motor de hardware
-from core.env_setup import ensure_optimal_onnx_runtime
+from core.env_setup import ensure_optimal_onnx_runtime  # noqa: E402
 ensure_optimal_onnx_runtime()
 
 from PyQt6.QtWidgets import QApplication  # noqa: E402

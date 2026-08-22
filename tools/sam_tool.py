@@ -1,24 +1,20 @@
-from PyQt6.QtWidgets import QGraphicsObject
-from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QImage, QPixmap
-from PyQt6.QtCore import Qt, QRectF
+import os
+import shutil
 import numpy as np
 import cv2
-import time
-from tools.ai_tool import get_base_path
-import os
 import onnxruntime as ort
-import gc
+from PyQt6.QtWidgets import QGraphicsObject
+from PyQt6.QtGui import QPen, QBrush, QImage, QPixmap
+from PyQt6.QtCore import Qt, QRectF
+from huggingface_hub import hf_hub_download
+from core.utils import get_base_path
+from tools.ai_tool import MODELS_CONFIG
 
 def _load_sam_decoder():
-    import os
-    from tools.ai_tool import MODELS_CONFIG, get_base_path
-    
     cfg = MODELS_CONFIG["MobileSAM"]
     base = get_base_path()
     dec_path = os.path.join(base, os.path.dirname(cfg["path"]), cfg["extra_files"][0])
     if not os.path.exists(dec_path):
-        from huggingface_hub import hf_hub_download
-        import shutil
         os.makedirs(os.path.dirname(dec_path), exist_ok=True)
         dec_cache = hf_hub_download(repo_id="PulpCut/mobilesam-onnx", filename="mobilesam.decoder.onnx")
         shutil.copy2(dec_cache, dec_path)
@@ -28,7 +24,6 @@ def _load_sam_decoder():
             enc_cache = hf_hub_download(repo_id="PulpCut/mobilesam-onnx", filename="mobilesam.encoder.onnx")
             shutil.copy2(enc_cache, enc_path)
 
-    import onnxruntime as ort
     return ort.InferenceSession(dec_path, providers=['CPUExecutionProvider'])
     
 class SAMTool(QGraphicsObject):

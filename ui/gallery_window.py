@@ -25,7 +25,7 @@ from PyQt6.QtCore import Qt, QFileSystemWatcher, QTimer
 from qfluentwidgets import setTheme, Theme, PrimaryPushButton
 
 from studio_logger import log_action, logger
-from core.utils import format_size
+from core.utils import format_size, load_pixmap_safely
 import core.file_manager as fm
 
 from core.threads import ThumbnailLoaderThread
@@ -116,8 +116,7 @@ class ImageGallery(QMainWindow):
         sb.addPermanentWidget(self.btn_log_console)
 
     def open_log_console(self):
-        from ui.log_console import LogConsoleWindow
-        self.log_console = LogConsoleWindow(self)
+        self.log_console = LogConsoleDialog(self)
         self.log_console.show()
 
     def update_dev_diag_visibility(self):
@@ -341,7 +340,7 @@ class ImageGallery(QMainWindow):
         if not os.path.exists(self.current_folder):
             return self.load_all_images()
 
-        valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".avif", ".heic", ".heif"}
         current_files_info = {}
         try:
             for entry in os.scandir(self.current_folder):
@@ -412,7 +411,7 @@ class ImageGallery(QMainWindow):
             self.viewer.setText("Vista Previa\n\nSeleccione carpeta")
             return
 
-        valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".avif", ".heic", ".heif"}
         image_files = []
         try:
             for entry in os.scandir(self.current_folder):
@@ -830,7 +829,7 @@ class ImageGallery(QMainWindow):
                 break
 
     @log_action("Abriendo consola nativa")
-    def open_log_console(self, checked=False):
+    def open_native_console(self, checked=False):
         import sys
         if getattr(sys, "frozen", False):
             import ctypes
@@ -880,5 +879,5 @@ class ImageGallery(QMainWindow):
 
     @log_action("Mostrando vista previa")
     def display_preview(self, path):
-        pix = QPixmap(path)
+        pix = load_pixmap_safely(path)
         self.viewer.setPixmap(pix)

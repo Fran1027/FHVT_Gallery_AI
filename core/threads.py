@@ -4,9 +4,6 @@ import warnings
 import numpy as np
 import cv2
 import onnxruntime as ort
-import tempfile
-import mcubes
-import trimesh
 from pathlib import Path
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, QSize, Qt
 from PyQt6.QtGui import QImage, QImageReader, QColor
@@ -21,7 +18,7 @@ def sensor_log(msg):
         with open(log_path, "a", encoding="utf-8") as f:
             t = time.strftime("%H:%M:%S")
             f.write(f"[{t}] {msg}\n")
-    except:
+    except Exception:
         pass
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -174,7 +171,7 @@ def _load_model(path):
 
     sensor_log(f"--- INIT _load_model: {os.path.basename(path)} ---")
     if use_cache and path in AI_MODELS:
-        sensor_log(f"Model already in AI_MODELS. Reusing.")
+        sensor_log("Model already in AI_MODELS. Reusing.")
         return AI_MODELS[path]
 
     # Si no usamos caché, o si es un modelo nuevo, limpiar primero la VRAM
@@ -188,7 +185,7 @@ def _load_model(path):
             AI_MODELS.clear()
             import gc
             gc.collect()
-            sensor_log(f"GC Collect finished.")
+            sensor_log("GC Collect finished.")
             logger.info("Caché de modelos IA limpiada para ahorrar VRAM.")
 
     if not path.lower().endswith(".onnx"):
@@ -207,10 +204,10 @@ def _load_model(path):
     opts.enable_mem_pattern = False
     opts.enable_cpu_mem_arena = False
 
-    sensor_log(f"Calling ort.InferenceSession...")
+    sensor_log("Calling ort.InferenceSession...")
     try:
         session = ort.InferenceSession(path, sess_options=opts, providers=providers)
-        sensor_log(f"ort.InferenceSession returned successfully.")
+        sensor_log("ort.InferenceSession returned successfully.")
     except Exception as e:
         sensor_log(f"ort.InferenceSession FAILED: {str(e)}")
         sensor_log(traceback.format_exc())
@@ -918,6 +915,21 @@ class ThumbnailLoaderThread(QThread):
                             "h": height,
                             "ext": os.path.splitext(file_path)[1].lower(),
                         }
+
+                # Fallback con Pillow (AVIF / HEIC / etc.)
+                from core.utils import load_qimage_pillow
+                img, width, height = load_qimage_pillow(file_path, (140, 140))
+                if not img.isNull():
+                    return {
+                        "file": file,
+                        "file_path": file_path,
+                        "img": img,
+                        "size": os.path.getsize(file_path),
+                        "mtime": os.path.getmtime(file_path),
+                        "w": width,
+                        "h": height,
+                        "ext": os.path.splitext(file_path)[1].lower(),
+                    }
             except Exception as e:
                 logger.debug(f"Archivo ignorado/corrupto ({file}): {str(e)}")
             return None
@@ -950,3 +962,74 @@ class ThumbnailLoaderThread(QThread):
 
     def stop(self):
         self._is_running = False
+
+
+class QuantizationWorker(QThread):
+    finished = pyqtSignal(QImage, int, list)
+
+    def __init__(self, qimage, num_colors=8, count_original=False):
+        super().__init__()
+        self.qimage = qimage
+        self.num_colors = max(2, min(256, num_colors))
+        self.count_original = count_original
+
+    def run(self):
+        try:
+            from PIL import Image
+
+            w, h = self.qimage.width(), self.qimage.height()
+            # Asegurar formato RGB888 o RGBA8888
+            fmt = self.qimage.format()
+            if fmt == QImage.Format.Format_RGBA8888:
+                src_qimg = self.qimage
+            elif fmt == QImage.Format.Format_RGB888:
+                src_qimg = self.qimage
+            else:
+                src_qimg = self.qimage.convertToFormat(QImage.Format.Format_RGBA8888)
+
+            ptr = src_qimg.bits()
+            ptr.setsize(src_qimg.sizeInBytes())
+
+            is_rgba = src_qimg.format() == QImage.Format.Format_RGBA8888
+            mode = "RGBA" if is_rgba else "RGB"
+            pil_img = Image.frombuffer(mode, (w, h), ptr, "raw", mode, 0, 1)
+
+            if is_rgba:
+                r, g, b, a = pil_img.split()
+                rgb_img = Image.merge("RGB", (r, g, b))
+            else:
+                rgb_img = pil_img.convert("RGB")
+
+            # Contar colores originales si se pide (solo primera vez)
+            original_color_count = -1
+            if self.count_original:
+                colors = rgb_img.getcolors(w * h)
+                if colors:
+                    original_color_count = len(colors)
+                else:
+                    original_color_count = w * h # Fallback
+
+            # Reducir paleta de colores usando Median Cut
+            quantized = rgb_img.quantize(colors=self.num_colors, method=0).convert("RGB")
+
+            # Extraer colores resultantes
+            res_colors = quantized.getcolors(w * h)
+            hex_list = []
+            if res_colors:
+                # res_colors es una lista de (count, (R, G, B))
+                for _, color in res_colors:
+                    r_c, g_c, b_c = color
+                    hex_list.append(f"#{r_c:02x}{g_c:02x}{b_c:02x}")
+
+            if is_rgba:
+                quantized.putalpha(a)
+                res_data = quantized.tobytes("raw", "RGBA")
+                result_qimg = QImage(res_data, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+            else:
+                res_data = quantized.tobytes("raw", "RGB")
+                result_qimg = QImage(res_data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+
+            self.finished.emit(result_qimg, original_color_count, hex_list)
+        except Exception as e:
+            logger.error(f"Error en QuantizationWorker: {e}")
+            self.finished.emit(self.qimage, -1, [])

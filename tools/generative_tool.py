@@ -17,8 +17,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-import multiprocessing
-import queue
 
 def hf_download_process(repo_id, cache_dir, q):
     """
@@ -27,7 +25,6 @@ def hf_download_process(repo_id, cache_dir, q):
     """
     import os
     from huggingface_hub import snapshot_download
-    from tqdm.auto import tqdm
     
     os.environ["HF_HOME"] = cache_dir
 
@@ -70,8 +67,8 @@ def hf_download_process(repo_id, cache_dir, q):
         q.put(("ERROR", str(e)))
 
 
-from core.utils import get_base_path
-from core.generative import CaptioningWorker, PromptEnhancerWorker
+from core.utils import get_base_path  # noqa: E402
+from core.generative import CaptioningWorker, PromptEnhancerWorker  # noqa: E402
 
 
 def is_model_downloaded(repo_id):
@@ -572,7 +569,6 @@ class GenerativeDialog(QDialog):
             self.btn_auto_prompt.setEnabled(True)
 
     def _on_mode_changed(self):
-        is_img2img = self.combo_mode.currentIndex() == 0
         is_txt2img = self.combo_mode.currentIndex() == 1
         is_inpaint = self.combo_mode.currentIndex() == 2
         

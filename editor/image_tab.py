@@ -20,27 +20,84 @@ from PyQt6.QtWidgets import (
     QProgressBar,
 )
 from PyQt6.QtGui import QPixmap, QFont, QImage, QPainter, QColor, QUndoStack
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRect
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRect, QPoint, QEvent, QObject
 
-from qfluentwidgets import Flyout
+from qfluentwidgets import Flyout, CommandBar, Action, FluentIcon, RoundMenu
+from qfluentwidgets.components.widgets.command_bar import (
+    CommandButton,
+    CommandMenu,
+    MenuAnimationType,
+)
 
-from core.threads import AIWorker, PaletteWorker
+from core.threads import AIWorker, PaletteWorker, QuantizationWorker
 from core.generative import GenerativeAIWorker
 
 from studio_logger import log_action, logger
 
 from editor.commands import EditorCommand
-from ui.widgets import ZoomableViewer, ModernMediaSlider, FullScreenViewer
+from ui.widgets import ZoomableViewer, ModernMediaSlider, FullScreenViewer, QuantizeControlsWidget
 from editor.canvas_items import ColorMarker
-from tools.factory import make_btn, make_icon_btn
+from tools.factory import make_btn
 from tools.mirror_tool import MirrorTool
 from tools.ai_tool import AIAdvancedDialog
 from tools.generative_tool import GenerativeDialog
 from core.hardware import check_cuda_support
 from core.processing import apply_image_transformations
-from core.utils import excede_limite_megapixeles
+from core.utils import excede_limite_megapixeles, load_pixmap_safely
 from ui.panels.canvas_panel import CanvasToolsPanel
 from ui.panels.palette_panel import PaletteToolsPanel
+
+
+class MenuHoverFilter(QObject):
+    """Filtro que abre el submenú nativo de QToolButton cuando el cursor pasa por encima."""
+    def __init__(self, target_widget):
+        super().__init__(target_widget)
+        self.target_widget = target_widget
+
+    def eventFilter(self, obj, event):
+        if obj == self.target_widget and event.type() == QEvent.Type.Enter:
+            # Delegar la apertura al event loop para no interrumpir el evento actual
+            QTimer.singleShot(0, self._desplegar_menu)
+        return super().eventFilter(obj, event)
+
+    def _desplegar_menu(self):
+        menu = self.target_widget.menu()
+        if menu:
+            # Forzamos la aparición justo debajo del botón
+            x = 0
+            y = self.target_widget.height() + 2
+            pos_global = self.target_widget.mapToGlobal(QPoint(x, y))
+            menu.exec(pos_global)
+
+
+class SmartCommandBar(CommandBar):
+    """CommandBar inteligente que ajusta la posición del menú desplegable (...) hacia la derecha si está cerca del borde izquierdo."""
+    def _showMoreActionsMenu(self):
+        self.moreButton.clearState()
+
+        actions = self._hiddenActions.copy()
+        for w in reversed(self._hiddenWidgets):
+            if isinstance(w, CommandButton):
+                actions.insert(0, w.action())
+
+        menu = CommandMenu(self)
+        menu.addActions(actions)
+
+        x = -menu.width() + menu.layout().contentsMargins().right() + \
+            self.moreButton.width() + 18
+        if self._menuAnimation == MenuAnimationType.DROP_DOWN:
+            y = self.moreButton.height()
+        else:
+            y = -5
+
+        global_pos = self.moreButton.mapToGlobal(QPoint(x, y))
+        btn_global_x = self.moreButton.mapToGlobal(QPoint(0, 0)).x()
+
+        # Si el menú intentaría abrirse fuera de la pantalla por la izquierda (x < 0), desplegar hacia la derecha:
+        if global_pos.x() < 0 or global_pos.x() < btn_global_x:
+            global_pos.setX(max(10, btn_global_x))
+
+        menu.exec(global_pos, aniType=self._menuAnimation)
 
 
 class SwatchFrame(QFrame):
@@ -186,6 +243,7 @@ class EditorState(Enum):
     EDIT_SAVE = auto()
     EDIT_AI = auto()
     EDIT_MAGIC_ERASER = auto()
+    EDIT_QUANTIZE = auto()
 
 
 # ==============================================================================
@@ -284,9 +342,6 @@ class ImageTab(QWidget):
     imageUpdated = pyqtSignal()
     navigateRequested = pyqtSignal(str)  # "prev" o "next"
 
-    STYLE_DEFAULT = "QPushButton { background: transparent; border: 1px solid #fff; border-radius: 6px; color: #ccc; } QPushButton:disabled { color: #444; border-color: #2a2a2a; } QPushButton:hover:enabled { background: rgba(255,255,255,0.1); }"
-    STYLE_ACTIVE = "QPushButton { background: #007acc; border: 1px solid #007acc; border-radius: 6px; color: white; } QPushButton:disabled { background: #1a1a1a; color: #444; border-color: #2a2a2a; }"
-    
     global_ai_lock = False
 
     # --- INICIALIZACIÓN ---
@@ -301,7 +356,7 @@ class ImageTab(QWidget):
         self.flip_h = False
         self.flip_v = False
         self.canvas_bg_color = Qt.GlobalColor.white
-        self.original_pixmap = QPixmap(file_path)
+        self.original_pixmap = load_pixmap_safely(file_path)
         self.brightness = 1.0
         self.contrast = 1.0
         self.canvas_L = 0
@@ -320,7 +375,9 @@ class ImageTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Toolbar
+        # --- REESTRUCTURACIÓN DE LA BARRA DE HERRAMIENTAS (SIN CommandBar) ---
+        from qfluentwidgets import TransparentToolButton, TransparentDropDownPushButton
+
         self.toolbar_container = QWidget()
         self.toolbar_container.setObjectName("toolbar_container")
         self.toolbar_container.setStyleSheet("""
@@ -330,89 +387,121 @@ class ImageTab(QWidget):
                 border-radius: 10px;
                 margin: 5px 10px;
             }
+            QToolButton {
+                background-color: transparent;
+                color: #ccc;
+                border-radius: 4px;
+                padding: 5px 8px;
+            }
+            QToolButton:hover { background-color: rgba(60, 60, 60, 0.9); color: white; }
+            QToolButton:checked { background-color: rgba(0, 122, 204, 0.6); color: white; border: 1px solid #007acc; }
         """)
         self.toolbar_layout = QHBoxLayout(self.toolbar_container)
         self.toolbar_layout.setContentsMargins(10, 5, 10, 5)
         self.toolbar_layout.setSpacing(6)
 
-        icon_font = QFont()
-        icon_font.setFamilies(["Segoe Fluent Icons", "Segoe MDL2 Assets"])
-        icon_font.setPointSize(14)
-        self.btn_fullscreen = make_btn(
-            "\ue740", "Pantalla Completa", icon_font, self.open_fullscreen
-        )
-        self.btn_edit = make_icon_btn(
-            "edit-image.png", "Editar Imagen", callback=self.toggle_edit_mode
-        )
-        self.btn_mirror = make_icon_btn(
-            "flip.png", "Opciones de Espejo", callback=self.toggle_mirror
-        )
-        self.btn_rotate = make_btn(
-            "\ue7ad", "Opciones de Giro", icon_font, self.toggle_rotate
-        )
-        self.btn_crop = make_btn(
-            "\ue7a8", "Recortar Imagen", icon_font, self.toggle_crop
-        )
-        self.btn_canvas = make_icon_btn(
-            "expand.png", "Ampliar Lienzo", callback=self.toggle_canvas
-        )
-        self.btn_adjust = make_btn(
-            "\ue706", "Brillo y Contraste", icon_font, self.toggle_adjust
-        )
-        self.btn_palette = make_btn(
-            "\ue790", "Extraer Paleta", icon_font, self.toggle_palette
-        )
-        self.btn_ai = make_icon_btn(
-            "artificial-intelligence.png", "Herramientas de IA", callback=self.toggle_ai
-        )
-        self.btn_generative = make_btn(
-            "\ue7b5", "Estilo IA", icon_font, self.toggle_generative
-        )
-        self.btn_eraser = make_btn(
-            "\ue81e", "Borrador Mágico", icon_font, self.toggle_magic_eraser
-        )
-        self.btn_undo = make_btn(
-            "\ue81c", "Deshacer Paso (Undo)", icon_font, self.undo_stack.undo
-        )
-        self.btn_redo = make_btn(
-            "\ue81d", "Rehacer Paso (Redo)", icon_font, self.undo_stack.redo
-        )
-        self.btn_cancel = make_btn(
-            "\ue711", "Cancelar Todo", icon_font, self.cancel_edits_prompt
-        )
-        # Definir grupos lógicos
-        self.toolbar_btns = [
-            self.btn_fullscreen,
-            self.btn_edit,
-            self.btn_mirror,
-            self.btn_rotate,
-            self.btn_crop,
-            self.btn_canvas,
-            self.btn_adjust,
-            self.btn_palette,
-            self.btn_ai,
-            self.btn_generative,
-            self.btn_eraser,
-            self.btn_undo,
-            self.btn_redo,
-            self.btn_cancel,
-        ]
-        self.edit_mode_btns = [
-            self.btn_mirror,
-            self.btn_rotate,
-            self.btn_crop,
-            self.btn_canvas,
-            self.btn_adjust,
-            self.btn_palette,
-            self.btn_ai,
-            self.btn_generative,
-            self.btn_eraser,
-            self.btn_redo,
+        self.action_map = {}
+        self.edit_mode_actions = []
+
+        # 1. Pantalla Completa
+        self.btn_fullscreen = TransparentToolButton(FluentIcon.FULL_SCREEN, self.toolbar_container)
+        self.btn_fullscreen.setToolTip("Pantalla Completa")
+        self.btn_fullscreen.clicked.connect(self.open_fullscreen)
+        self.toolbar_layout.addWidget(self.btn_fullscreen)
+        self.action_map["fullscreen"] = self.btn_fullscreen
+
+        # 2. Menú de Edición (Submenú nativo robusto con PushButton)
+        self.btn_edit = TransparentDropDownPushButton(FluentIcon.EDIT, "Editar Imagen", self.toolbar_container)
+        self.btn_edit.setCheckable(True)
+        
+        self.edit_menu = RoundMenu(parent=self.btn_edit)
+        self.edit_menu.setStyleSheet("""
+            RoundMenu, .RoundMenu {
+                background-color: #1e1e1e;
+                border: 1px solid #333333;
+                border-radius: 8px;
+            }
+            QMenuItem { color: #ccc; padding: 6px 12px; }
+            QMenuItem:selected { background-color: rgba(255, 255, 255, 0.1); color: white; }
+            QMenuItem:checked { background-color: rgba(0, 122, 204, 0.6); color: white; }
+            QMenuItem:checked:selected { background-color: rgba(0, 122, 204, 0.8); color: white; }
+        """)
+
+        EDIT_TOOLS_CONFIG = [
+            ("mirror",     FluentIcon.LAYOUT,      "Opciones de Espejo",self.toggle_mirror,    EditorState.EDIT_MIRROR),
+            ("rotate",     FluentIcon.SYNC,        "Opciones de Giro",  self.toggle_rotate,    EditorState.EDIT_ROTATE),
+            ("crop",       FluentIcon.CUT,         "Recortar Imagen",   self.toggle_crop,      EditorState.EDIT_CROP),
+            ("canvas",     FluentIcon.FIT_PAGE,    "Ampliar Lienzo",    self.toggle_canvas,    EditorState.EDIT_CANVAS),
+            ("adjust",     FluentIcon.BRIGHTNESS,  "Brillo y Contraste",self.toggle_adjust,    EditorState.EDIT_ADJUST),
+            ("palette",    FluentIcon.PALETTE,     "Extraer Paleta",    self.toggle_palette,   EditorState.EDIT_PALETTE),
+            ("quantize",   FluentIcon.PALETTE,     "Cuantizar Colores", self.toggle_quantize,  EditorState.EDIT_QUANTIZE),
+            ("ai",         FluentIcon.ROBOT,       "Herramientas de IA",self.toggle_ai,        EditorState.EDIT_AI),
+            ("generative", FluentIcon.PHOTO,       "Estilo IA",         self.toggle_generative,None),
+            ("eraser",     FluentIcon.ERASE_TOOL,  "Borrador Mágico",   self.toggle_magic_eraser, EditorState.EDIT_MAGIC_ERASER),
         ]
 
-        for b in self.toolbar_btns:
-            self.toolbar_layout.addWidget(b)
+        for action_id, icon, text, callback, state in EDIT_TOOLS_CONFIG:
+            action = Action(icon, text, self.edit_menu)
+            action.triggered.connect(callback)
+            action.setCheckable(True)
+            self.edit_menu.addAction(action)
+            self.action_map[action_id] = action
+            self.edit_mode_actions.append(action)
+
+        self.btn_edit.setMenu(self.edit_menu)
+        self.toolbar_layout.addWidget(self.btn_edit)
+        self.action_map["edit"] = self.btn_edit
+
+        # Hover Filter seguro
+        class MenuHoverFilter(QObject):
+            def __init__(self, btn):
+                super().__init__(btn)
+                self.btn = btn
+            def eventFilter(self, obj, event):
+                if obj == self.btn and event.type() == QEvent.Type.Enter:
+                    QTimer.singleShot(0, self.show_menu)
+                return super().eventFilter(obj, event)
+            def show_menu(self):
+                if self.btn.menu() and not self.btn.menu().isVisible():
+                    # Forzamos posición
+                    pos = self.btn.mapToGlobal(QPoint(0, self.btn.height() + 2))
+                    self.btn.menu().exec(pos)
+
+        self._btn_edit_hover_filter = MenuHoverFilter(self.btn_edit)
+        self.btn_edit.installEventFilter(self._btn_edit_hover_filter)
+
+        # Separador nativo
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setStyleSheet("border-left: 1px solid rgba(255, 255, 255, 0.2); margin: 5px 0px;")
+        self.toolbar_layout.addWidget(separator)
+
+        # 3. Deshacer / Rehacer / Cancelar
+        self.btn_undo = TransparentToolButton(FluentIcon.HISTORY, self.toolbar_container)
+        self.btn_undo.setToolTip("Deshacer (Undo)")
+        self.btn_undo.clicked.connect(self.undo_stack.undo)
+        self.toolbar_layout.addWidget(self.btn_undo)
+        self.action_map["undo"] = self.btn_undo
+
+        self.btn_redo = TransparentToolButton(FluentIcon.CHEVRON_RIGHT, self.toolbar_container)
+        self.btn_redo.setToolTip("Rehacer (Redo)")
+        self.btn_redo.clicked.connect(self.undo_stack.redo)
+        self.toolbar_layout.addWidget(self.btn_redo)
+        self.action_map["redo"] = self.btn_redo
+
+        self.btn_cancel = TransparentToolButton(FluentIcon.CANCEL, self.toolbar_container)
+        self.btn_cancel.setToolTip("Cancelar Todo")
+        self.btn_cancel.clicked.connect(self.cancel_edits_prompt)
+        self.toolbar_layout.addWidget(self.btn_cancel)
+        self.action_map["cancel"] = self.btn_cancel
+
         self.toolbar_layout.addStretch()
+
+        # Atajos de teclado
+        from PyQt6.QtGui import QKeySequence, QShortcut
+        QShortcut(QKeySequence.StandardKey.Undo, self).activated.connect(self.undo_stack.undo)
+        QShortcut(QKeySequence.StandardKey.Redo, self).activated.connect(self.undo_stack.redo)
+        QShortcut(QKeySequence("F11"), self).activated.connect(self.open_fullscreen)
 
         from PyQt6.QtWidgets import QMenu
         self.btn_save_main = QPushButton(" Guardar ")
@@ -536,6 +625,11 @@ class ImageTab(QWidget):
         )
         self.btn_ai_undo.setVisible(False)
 
+        self.quantize_widget = QuantizeControlsWidget(self)
+        self.quantize_widget.setVisible(False)
+        self.quantize_widget.slider.valueChanged.connect(self._on_quantize_colors_changed)
+
+        self.ai_confirm_layout.addWidget(self.quantize_widget)
         self.ai_confirm_layout.addWidget(self.btn_ai_undo)
         self.ai_confirm_layout.addWidget(self.btn_ai_save)
         self.ai_confirm_layout.addWidget(self.btn_ai_discard)
@@ -662,6 +756,9 @@ class ImageTab(QWidget):
         self.palette_scroll.setWidget(self.palette_scroll_content)
 
         palette_main_layout.addWidget(self.palette_scroll, 1)
+        icon_font = QFont()
+        icon_font.setFamilies(["Segoe Fluent Icons", "Segoe MDL2 Assets"])
+        icon_font.setPointSize(14)
         self.btn_export_palette = make_btn(
             "\ue72d", "Exportar Paleta", icon_font, self.export_palette_image
         )
@@ -750,9 +847,8 @@ class ImageTab(QWidget):
 
         if state != EditorState.EDIT_PALETTE:
             self._clear_palette_markers()
-        for b in self.edit_mode_btns:
-            b.setStyleSheet(self.STYLE_DEFAULT)
-            b.setVisible(state != EditorState.MAIN)
+        for b in self.edit_mode_actions:
+            b.setChecked(False)
 
         is_crop = state == EditorState.EDIT_CROP
         self.viewer.set_crop_mode(is_crop)
@@ -770,32 +866,29 @@ class ImageTab(QWidget):
             self.eraser_panel.setVisible(is_eraser)
 
         if state == EditorState.MAIN:
-            self.btn_edit.setStyleSheet(self.STYLE_DEFAULT)
-            for b in [self.btn_undo, self.btn_redo, self.btn_cancel]:
-                b.setVisible(False)
+            self.action_map["edit"].setChecked(False)
         else:
-            self.btn_edit.setStyleSheet(self.STYLE_ACTIVE)
-            for b in [self.btn_undo, self.btn_redo, self.btn_cancel]:
-                b.setVisible(True)
+            self.action_map["edit"].setChecked(True)
             if state in [EditorState.EDIT_ADJUST, EditorState.EDIT_ROTATE]:
                 self._create_proxy_pixmap()
 
         active_map = {
             EditorState.EDIT_ADJUST: (
-                self.btn_adjust,
+                self.action_map["adjust"],
                 [self.br_container, self.ct_container],
             ),
-            EditorState.EDIT_ROTATE: (self.btn_rotate, [self.rt_container]),
-            EditorState.EDIT_CROP: (self.btn_crop, []),
-            EditorState.EDIT_PALETTE: (self.btn_palette, []),
-            EditorState.EDIT_MIRROR: (self.btn_mirror, []),
-            EditorState.EDIT_CANVAS: (self.btn_canvas, []),
-            EditorState.EDIT_AI: (self.btn_ai, []),
-            EditorState.EDIT_MAGIC_ERASER: (self.btn_eraser, []),
+            EditorState.EDIT_ROTATE: (self.action_map["rotate"], [self.rt_container]),
+            EditorState.EDIT_CROP: (self.action_map["crop"], []),
+            EditorState.EDIT_PALETTE: (self.action_map["palette"], []),
+            EditorState.EDIT_MIRROR: (self.action_map["mirror"], []),
+            EditorState.EDIT_CANVAS: (self.action_map["canvas"], []),
+            EditorState.EDIT_QUANTIZE: (self.action_map["quantize"], []),
+            EditorState.EDIT_AI: (self.action_map["ai"], []),
+            EditorState.EDIT_MAGIC_ERASER: (self.action_map["eraser"], []),
         }
         if state in active_map:
             btn, show_containers = active_map[state]
-            btn.setStyleSheet(self.STYLE_ACTIVE)
+            btn.setChecked(True)
             if state in [EditorState.EDIT_ADJUST, EditorState.EDIT_ROTATE]:
                 for c in (self.br_container, self.ct_container, self.rt_container):
                     c.setVisible(c in show_containers)
@@ -805,7 +898,7 @@ class ImageTab(QWidget):
 
     def _toggle_flyout_tool(self, state, tool_class, btn_widget, **tool_kwargs):
         if self.current_state == state:
-            self.set_state(EditorState.EDIT_ROOT)
+            return  # No hacer nada si ya está activo
         else:
             self.set_state(state)
             view = tool_class(**tool_kwargs)
@@ -828,25 +921,15 @@ class ImageTab(QWidget):
 
     def _toggle_simple_state(self, state, on_exit=None):
         if self.current_state == state:
-            if on_exit:
-                on_exit()
-            self.set_state(EditorState.EDIT_ROOT)
+            return  # No hacer nada si ya está activo
         else:
             self.set_state(state)
-
-    # --- ACCIONES DE LA BARRA DE HERRAMIENTAS ---
-    def toggle_edit_mode(self):
-        self.set_state(
-            EditorState.EDIT_ROOT
-            if self.current_state == EditorState.MAIN
-            else EditorState.MAIN
-        )
 
     def toggle_mirror(self):
         self._toggle_flyout_tool(
             EditorState.EDIT_MIRROR,
             MirrorTool,
-            self.btn_mirror,
+            self.btn_edit,
             on_flip_h=self.toggle_flip_h,
             on_flip_v=self.toggle_flip_v,
         )
@@ -884,16 +967,68 @@ class ImageTab(QWidget):
     def toggle_magic_eraser(self):
         self._toggle_simple_state(EditorState.EDIT_MAGIC_ERASER)
 
-    def toggle_generative(self):
-        if self.current_state == EditorState.EDIT_AI:
-            self._toggle_simple_state(EditorState.MAIN)
+    def toggle_quantize(self):
+        if self.current_state == EditorState.EDIT_QUANTIZE:
+            self.set_state(EditorState.EDIT_ROOT)
         else:
-            self.set_state(EditorState.EDIT_AI)
-        
-        dialog = GenerativeDialog(self.original_pixmap, self)
-        dialog.generated.connect(self.on_generative_batch_finished)
-        dialog.exec()
-        self.set_state(EditorState.MAIN)
+            self.set_state(EditorState.EDIT_QUANTIZE)
+            self.current_ai_mode = "quantize"
+            self.ai_confirm_panel.setVisible(True)
+            self.btn_ai_undo.setVisible(False)
+            self.quantize_widget.setVisible(True)
+            self.quantize_widget.slider.blockSignals(True)
+            self.quantize_widget.spin.blockSignals(True)
+            self.quantize_widget.slider.setValue(8)
+            self.quantize_widget.spin.setValue(8)
+            self.quantize_widget.slider.blockSignals(False)
+            self.quantize_widget.spin.blockSignals(False)
+            self.quantize_widget.set_stats(0, 0, [])
+            self.quantize_widget.lbl_original_count.setText("Colores Origen: Calculando...")
+            self.original_color_count_cache = -1
+            self._on_quantize_colors_changed(8)
+
+    def _on_quantize_colors_changed(self, num_colors):
+        if self.original_pixmap.isNull():
+            return
+
+        if hasattr(self, "quant_worker") and self.quant_worker and self.quant_worker.isRunning():
+            self.quant_worker.terminate()
+            self.quant_worker.wait()
+
+        self.current_ai_mode = "quantize"
+        orig_qimg = self.original_pixmap.toImage()
+
+        count_orig = getattr(self, "original_color_count_cache", -1) == -1
+        self.quant_worker = QuantizationWorker(orig_qimg, num_colors=num_colors, count_original=count_orig)
+        self.quant_worker.finished.connect(self._on_quantize_finished)
+        self.quant_worker.start()
+
+    def _on_quantize_finished(self, result_qimg, original_count, hex_list):
+        if result_qimg.isNull() or self.original_pixmap.isNull():
+            return
+
+        self.ai_result_qimage = result_qimg
+
+        if original_count != -1:
+            self.original_color_count_cache = original_count
+
+        if hasattr(self, "quantize_widget") and self.quantize_widget.isVisible():
+            res_count = len(hex_list) if hex_list else self.quant_worker.num_colors
+            self.quantize_widget.set_stats(self.original_color_count_cache, res_count, hex_list)
+
+        orig_scaled = self.original_pixmap.scaled(
+            result_qimg.width(),
+            result_qimg.height(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.viewer.setComparisonMode(orig_scaled, QPixmap.fromImage(result_qimg))
+
+        self.btn_ai_save.setText("✅  Aplicar Cuantización")
+        self.btn_ai_undo.setVisible(False)
+        self.ai_confirm_panel.setVisible(True)
+        self.ai_overlay.show_review_mode()
+        self.viewer_v_container.raise_()
 
     def toggle_ai(self):
         self.set_state(EditorState.EDIT_AI)
@@ -1474,7 +1609,7 @@ class ImageTab(QWidget):
         if not hasattr(self, "ai_result_qimage"):
             return
 
-        if getattr(self, "current_ai_mode", "") in ["rmbg", "sam_encode"]:
+        if getattr(self, "current_ai_mode", "") in ["rmbg", "sam_encode", "quantize"]:
             is_inline_edit = True
 
         temp_to_delete = None
@@ -1559,6 +1694,8 @@ class ImageTab(QWidget):
             self.viewer.show_ai_processing(False)
             
         self.ai_confirm_panel.setVisible(False)
+        if hasattr(self, "quantize_widget"):
+            self.quantize_widget.setVisible(False)
         self.ai_overlay.hide_processing()
         self.viewer.setPixmap(self.original_pixmap)
         self._set_toolbar_enabled(True)
@@ -1594,15 +1731,15 @@ class ImageTab(QWidget):
     def _set_toolbar_enabled(self, enabled):
         """Bloquea o desbloquea toda la barra de herramientas superior."""
         tools = [
-            self.btn_fullscreen,
-            self.btn_edit,
-            self.btn_mirror,
-            self.btn_rotate,
-            self.btn_canvas,
-            self.btn_adjust,
-            self.btn_palette,
-            self.btn_ai,
-            self.btn_generative,
+            self.action_map["fullscreen"],
+            self.action_map["edit"],
+            self.action_map["mirror"],
+            self.action_map["rotate"],
+            self.action_map["canvas"],
+            self.action_map["adjust"],
+            self.action_map["palette"],
+            self.action_map["ai"],
+            self.action_map["generative"],
         ]
         for b in tools:
             b.setEnabled(enabled)
@@ -1610,7 +1747,7 @@ class ImageTab(QWidget):
         if enabled:
             self.update_menu_state()
         else:
-            for b in [self.btn_undo, self.btn_redo, self.btn_cancel, self.btn_save_main]:
+            for b in [self.action_map["undo"], self.action_map["redo"], self.action_map["cancel"], self.btn_save_main]:
                 b.setEnabled(False)
 
     def _clear_palette_markers(self):
@@ -1748,9 +1885,9 @@ class ImageTab(QWidget):
         has_history = self.undo_stack.count() > 0 or is_dirty
 
         if self.current_state != EditorState.MAIN:
-            self.btn_undo.setEnabled(self.undo_stack.canUndo())
-            self.btn_redo.setEnabled(self.undo_stack.canRedo())
-            self.btn_cancel.setEnabled(has_history)
+            self.action_map["undo"].setEnabled(self.undo_stack.canUndo())
+            self.action_map["redo"].setEnabled(self.undo_stack.canRedo())
+            self.action_map["cancel"].setEnabled(has_history)
             
         self.btn_save_main.setEnabled(has_history)
 
@@ -1788,7 +1925,7 @@ class ImageTab(QWidget):
 
     def cancel_edits(self):
         self._reset_transformation_params()
-        self.original_pixmap = QPixmap(self.file_path)
+        self.original_pixmap = load_pixmap_safely(self.file_path)
         self.undo_stack.clear()
         self.update_image()
         self.ai_overlay.hide_processing()
