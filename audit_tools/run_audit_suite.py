@@ -79,7 +79,7 @@ def run_ruff_linter(project_root):
 def main():
     start_total = time.time()
     print("\n" + "#" * 80)
-    print("🚀 FHVT STUDIO IMAGE EDITOR - COMPLETE ARCHITECTURAL AUDIT & DEBUGGING SUITE")
+    print("🚀 FHVT GALLERY AI - COMPLETE ARCHITECTURAL AUDIT & DEBUGGING SUITE")
     print("#" * 80 + "\n")
 
     # 1. AST Syntax compilation check

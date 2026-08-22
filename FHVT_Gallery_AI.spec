@@ -39,7 +39,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='FHVT_Studio_Image_Editor',
+    name='FHVT_Gallery_AI',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -58,5 +58,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='FHVT_Studio_Image_Editor',
+    name='FHVT_Gallery_AI',
 )

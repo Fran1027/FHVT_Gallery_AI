@@ -12,7 +12,7 @@ if not exist "%VENV_PYTHON%" (
 )
 
 echo ===============================================================================
-echo   FHVT STUDIO IMAGE EDITOR - AUDITORIA ARQUITECTURAL Y DIAGNOSTICO EN VIVO
+echo   FHVT GALLERY AI - AUDITORIA ARQUITECTURAL Y DIAGNOSTICO EN VIVO
 echo ===============================================================================
 echo.
 

@@ -1,5 +1,5 @@
 @echo off
-title FHVT Studio Image Editor
+title FHVT Gallery AI
 cd /d "%~dp0"
 
 :: Verificar entorno virtual

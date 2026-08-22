@@ -1,5 +1,5 @@
 # ===============================================================================
-# FHVT STUDIO IMAGE EDITOR - PROTOCOLO DE RECUPERACIÓN EN PC NUEVA
+# FHVT GALLERY AI - PROTOCOLO DE RECUPERACIÓN EN PC NUEVA
 # (Guía Rápida ante Pérdida de Disco o Migración de Sistema)
 # ===============================================================================
 
@@ -30,7 +30,7 @@ Abre una terminal (PowerShell o CMD) y ejecuta:
 
 --- PASO 2.1: CLONAR EL REPOSITORIO ---
 git clone <URL_DE_TU_REPOSITORIO_GITHUB>
-cd FHVT_Studio_Image_Editor
+cd FHVT_Gallery_AI
 
 --- PASO 2.2: CREAR EL ENTORNO VIRTUAL E INSTALAR DEPENDENCIAS ---
 python -m venv .venv
@@ -70,11 +70,11 @@ O mediante consola:
 -------------------------------------------------------------------------------
 5. COMPILAR EJECUTABLE .EXE INDEPENDIENTE (OPCIONAL)
 -------------------------------------------------------------------------------
-El archivo de empaquetado 'FHVT_Studio_Image_Editor.spec' ya está configurado
+El archivo de empaquetado 'FHVT_Gallery_AI.spec' ya está configurado
 con todos los módulos ocultos y assets necesarios.
 
 Para compilar un ejecutable portable en la nueva PC:
-.\.venv\Scripts\pyinstaller FHVT_Studio_Image_Editor.spec
+.\.venv\Scripts\pyinstaller FHVT_Gallery_AI.spec
 
 El archivo final generado estará en:
-dist/FHVT_Studio_Image_Editor/FHVT_Studio_Image_Editor.exe
+dist/FHVT_Gallery_AI/FHVT_Gallery_AI.exe

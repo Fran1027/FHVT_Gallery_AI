@@ -23,9 +23,9 @@ def generate_ico(png_path, ico_path):
         print(f"[!] Error generando .ico: {e}")
         return False
 
-def create_windows_shortcut(target_exe, script_path, work_dir, ico_path, shortcut_path, description="FHVT Studio Image Editor"):
+def create_windows_shortcut(target_exe, script_path, work_dir, ico_path, shortcut_path, description="FHVT Gallery AI"):
     """Crea un acceso directo .lnk de Windows usando WScript.Shell."""
-    import win32com.client # O fallback con PowerShell / VBScript
+    import win32com.client  # O fallback con PowerShell / VBScript
     try:
         shell = win32com.client.Dispatch("WScript.Shell")
         shortcut = shell.CreateShortCut(str(shortcut_path))
@@ -86,14 +86,28 @@ def main():
     # 2. Rutas de destino para los accesos directos
     # a) En el Escritorio del usuario
     desktop_dir = Path(os.path.expanduser("~")) / "Desktop"
-    desktop_shortcut = desktop_dir / "FHVT Studio Image Editor.lnk"
+    desktop_shortcut = desktop_dir / "FHVT Gallery AI.lnk"
     
     # b) En la carpeta del proyecto
-    project_shortcut = project_root / "FHVT Studio Image Editor.lnk"
-    outer_project_shortcut = project_root.parent / "FHVT Studio Image Editor.lnk"
+    project_shortcut = project_root / "FHVT Gallery AI.lnk"
+    outer_project_shortcut = project_root.parent / "FHVT Gallery AI.lnk"
+
+    # Limpiar posibles accesos antiguos
+    old_shortcuts = [
+        desktop_dir / "FHVT Studio Image Editor.lnk",
+        project_root / "FHVT Studio Image Editor.lnk",
+        project_root.parent / "FHVT Studio Image Editor.lnk"
+    ]
+    for old_s in old_shortcuts:
+        if old_s.exists():
+            try:
+                os.remove(old_s)
+                print(f"[-] Acceso directo antiguo eliminado: {old_s}")
+            except Exception:
+                pass
 
     print("=" * 70)
-    print("🚀 CREANDO ACCESOS DIRECTOS DE FHVT STUDIO IMAGE EDITOR")
+    print("🚀 CREANDO ACCESOS DIRECTOS DE FHVT GALLERY AI")
     print("=" * 70)
 
     # Crear en el Escritorio
@@ -126,7 +140,7 @@ def main():
         )
 
     print("=" * 70)
-    print("✅ ¡Listo! Puedes anclar el acceso directo a la Barra de Tareas o al Menú Inicio.")
+    print("✅ ¡Listo! Puedes anclar 'FHVT Gallery AI' a la Barra de Tareas o al Menú Inicio.")
     print("=" * 70)
 
 if __name__ == "__main__":

@@ -119,7 +119,7 @@ def run_privacy_audit(project_root):
 
 def print_privacy_report(results):
     print("=" * 80)
-    print("🔒 FHVT STUDIO - AUDITORÍA DE PRIVACIDAD, SECRETOS Y FUGA DE INFORMACIÓN")
+    print("🔒 FHVT GALLERY AI - AUDITORÍA DE PRIVACIDAD, SECRETOS Y FUGA DE INFORMACIÓN")
     print("=" * 80)
     
     findings = results["findings"]

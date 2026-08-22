@@ -562,7 +562,7 @@ class AIAdvancedDialog(QDialog):
         super().__init__(parent)
         self.actions = actions
         self.selected_model = None
-        self.setWindowTitle("FHVT gallery")
+        self.setWindowTitle("FHVT Gallery AI")
         self.setFixedSize(1150, 780)
 
         self.setStyleSheet("""

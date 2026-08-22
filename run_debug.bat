@@ -1,5 +1,5 @@
 @echo off
-title FHVT Studio Image Editor (Modo Depuracion)
+title FHVT Gallery AI (Modo Depuracion)
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (
@@ -11,7 +11,7 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-echo Iniciando FHVT Studio Image Editor en modo consola...
+echo Iniciando FHVT Gallery AI en modo consola...
 ".venv\Scripts\python.exe" main.py %*
 if %ERRORLEVEL% NEQ 0 (
     echo.

@@ -41,7 +41,7 @@ class ImageGallery(QMainWindow):
         super().__init__()
         setTheme(Theme.DARK)
         self.ignore_watcher = False
-        self.setWindowTitle("FHVT gallery")
+        self.setWindowTitle("FHVT Gallery AI")
         self.resize(1300, 800)
         self.setMinimumSize(1000, 680)
 
