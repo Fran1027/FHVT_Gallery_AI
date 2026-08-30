@@ -4,14 +4,22 @@ import warnings
 import numpy as np
 import cv2
 import onnxruntime as ort
-import tempfile
-import mcubes
-import trimesh
 from pathlib import Path
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, QSize, Qt
 from PyQt6.QtGui import QImage, QImageReader, QColor
 from studio_logger import logger, log_action
 from .utils import get_base_path
+import time
+import traceback
+
+def sensor_log(msg):
+    try:
+        log_path = os.path.join(get_base_path(), "logs", "agent_sensors.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            t = time.strftime("%H:%M:%S")
+            f.write(f"[{t}] {msg}\n")
+    except Exception:
+        pass
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -39,12 +47,12 @@ def _get_vram_info():
     try:
         import subprocess
 
-        # Añadir bandera para ejecución silenciosa (Evita falsos positivos de AV y parpadeos de consola)
+        # Configurar ejecución silenciosa (previene falsos AV y parpadeos)
         import sys
 
         CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
-        # Intenta nvidia-smi para GPUs NVIDIA
+        # Probar nvidia-smi para NVIDIA
         try:
             result = subprocess.run(
                 [
@@ -63,7 +71,7 @@ def _get_vram_info():
         except Exception:
             pass
 
-        # Fallback universal para Windows (AMD / Intel) via WMIC (Más amigable con Antivirus que PowerShell)
+        # Utilizar fallback WMIC para AMD/Intel
         if sys.platform == "win32":
             try:
                 res = subprocess.run(
@@ -74,7 +82,7 @@ def _get_vram_info():
                     creationflags=CREATE_NO_WINDOW,
                 )
                 if res.returncode == 0 and res.stdout.strip():
-                    # WMIC devuelve un header, leemos la segunda línea válida
+                    # Leer segunda línea válida de output WMIC
                     lines = [
                         line.strip()
                         for line in res.stdout.split("\n")
@@ -87,7 +95,7 @@ def _get_vram_info():
             except Exception:
                 pass
 
-        # Devuelve None para indicar que no se pudo detectar
+        # Retornar None si falla la detección
         return None
 
     except Exception:
@@ -97,7 +105,7 @@ def _get_vram_info():
 def _format_vram_warning(vram_available):
     """Formatea el mensaje de VRAM de manera inteligente."""
     if vram_available is None:
-        # No se pudo detectar VRAM real
+        # Manejar fallo en detección VRAM
         return (
             "Tu Tarjeta Gráfica se ha quedado sin memoria (VRAM) suficiente.\n\n"
             "Soluciones:\n"
@@ -106,7 +114,7 @@ def _format_vram_warning(vram_available):
             "• Cierra otras aplicaciones que usen GPU"
         )
     else:
-        # Se detectó VRAM real
+        # Registrar VRAM detectada
         return (
             f"La memoria de tu Tarjeta Gráfica (VRAM) se ha llenado por completo.\n\n"
             f"Al momento del error, solo quedaban ~{vram_available:.1f} GB libres, lo cual impidió procesar la imagen.\n\n"
@@ -157,16 +165,28 @@ def _resolve_model_path(path):
 def _load_model(path):
     """Carga un modelo ONNX con el mejor provider disponible."""
     global AI_MODELS
-    if path in AI_MODELS:
+    from PyQt6.QtCore import QSettings
+    settings = QSettings("FHVT_Studio", "ImageEditor")
+    use_cache = settings.value("cache_ai_models", True, type=bool)
+
+    sensor_log(f"--- INIT _load_model: {os.path.basename(path)} ---")
+    if use_cache and path in AI_MODELS:
+        sensor_log("Model already in AI_MODELS. Reusing.")
         return AI_MODELS[path]
 
-    # Liberar memoria de modelos anteriores para no acumular VRAM
+    # Si no usamos caché, o si es un modelo nuevo, limpiar primero la VRAM
     if len(AI_MODELS) > 0:
-        AI_MODELS.clear()
-        import gc
-
-        gc.collect()
-        logger.info("Caché de modelos IA limpiada para ahorrar VRAM.")
+        # Solo limpiar si la caché está desactivada, O si hay otro modelo distinto ocupando espacio
+        if not use_cache or path not in AI_MODELS:
+            sensor_log(f"Clearing previous models from AI_MODELS. Current keys: {list(AI_MODELS.keys())}")
+            # Forzar destrucción de los objetos de sesión
+            for key in list(AI_MODELS.keys()):
+                del AI_MODELS[key]
+            AI_MODELS.clear()
+            import gc
+            gc.collect()
+            sensor_log("GC Collect finished.")
+            logger.info("Caché de modelos IA limpiada para ahorrar VRAM.")
 
     if not path.lower().endswith(".onnx"):
         raise RuntimeError(
@@ -176,19 +196,33 @@ def _load_model(path):
         )
 
     providers = _get_providers()
+    sensor_log(f"Providers targeted: {providers}")
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    
+    # Desactivar pre-asignación de memoria para evitar fugas de VRAM y fragmentación
+    opts.enable_mem_pattern = False
+    opts.enable_cpu_mem_arena = False
 
-    session = ort.InferenceSession(path, sess_options=opts, providers=providers)
+    sensor_log("Calling ort.InferenceSession...")
+    try:
+        session = ort.InferenceSession(path, sess_options=opts, providers=providers)
+        sensor_log("ort.InferenceSession returned successfully.")
+    except Exception as e:
+        sensor_log(f"ort.InferenceSession FAILED: {str(e)}")
+        sensor_log(traceback.format_exc())
+        raise
 
-    # Prevenir que ONNX falle silenciosamente hacia la CPU si el usuario tiene GPU
+    # Evitar fallback silencioso de ONNX a CPU
     active_providers = session.get_providers()
+    sensor_log(f"Active providers achieved: {active_providers}")
     if (
         "DmlExecutionProvider" in providers
         and "DmlExecutionProvider" not in active_providers
     ):
-        # ONNX descartó DirectML (probablemente por falta de VRAM o error interno de decodificación)
-        # Bloqueamos la ejecución porque procesar IA de imágenes gigantes en CPU tomará una eternidad.
+        sensor_log("FALLBACK DETECTED! DmlExecutionProvider requested but missing from active_providers.")
+        # Detectar descarte de DirectML por ONNX
+        # Bloquear ejecución en CPU por tiempos extremos
         raise RuntimeError(
             "❌ RECHAZO DE HARDWARE (Fallback a CPU detectado)\n\n"
             "El modelo intentó cargarse en la Tarjeta Gráfica pero falló "
@@ -198,7 +232,8 @@ def _load_model(path):
             "Por favor, selecciona un modelo más ligero (Lite/FP16)."
         )
 
-    AI_MODELS[path] = session
+    if use_cache:
+        AI_MODELS[path] = session
     logger.info(
         f"Modelo ONNX cargado | Provider: {_get_active_provider(session)} | {os.path.basename(path)}"
     )
@@ -259,7 +294,7 @@ class PaletteWorker(QObject):
             if len(result) >= 5:
                 break
             c = item["color"]
-            # Evitar colores repetidos
+            # Evitar duplicar colores
             if not any(
                 abs(c.red() - r["color"].red())
                 + abs(c.green() - r["color"].green())
@@ -273,7 +308,7 @@ class PaletteWorker(QObject):
 
 
 class AIWorker(QObject):
-    result_ready = pyqtSignal(QImage)
+    result_ready = pyqtSignal(object)
     finished = pyqtSignal()
     progress = pyqtSignal(int, int)
     error = pyqtSignal(str)
@@ -314,12 +349,20 @@ class AIWorker(QObject):
                 result_rgba = self._process_depth(img_rgba, model_full_path)
             elif self.mode == "normal":
                 result_rgba = self._process_normal(img_rgba, model_full_path)
+            elif self.mode == "sam_encode":
+                result_rgba = self._process_sam_encode(img_rgba, model_full_path)
             elif self.mode == "upscale" or self.mode == "restore":
                 result_rgba = self._process_upscale_tiled(img_rgba, model_full_path)
             else:
                 result_rgba = None
 
             self.progress.emit(100, 100)
+
+            # Retornar tensor crudo para SAM
+            if self.mode == "sam_encode":
+                self.result_ready.emit(result_rgba)
+                self.finished.emit()
+                return
 
             if result_rgba is not None:
                 bgra = cv2.cvtColor(result_rgba, cv2.COLOR_RGBA2BGRA)
@@ -334,7 +377,7 @@ class AIWorker(QObject):
         except Exception as e:
             self.error.emit(f"Error IA: {str(e)}")
 
-            # Limpiar caché de modelos para liberar VRAM tras un fallo crítico
+            # Purgar caché para liberar VRAM tras fallo crítico
             global AI_MODELS
             AI_MODELS.clear()
             import gc
@@ -348,7 +391,7 @@ class AIWorker(QObject):
         input_name = inp.name
         expected_type = inp.type
 
-        # Conversión dinámica (Auto-Cast) según lo que el modelo requiera
+        # Aplicar auto-cast dinámico según modelo
         if "float16" in expected_type and input_tensor.dtype != np.float16:
             input_tensor = input_tensor.astype(np.float16)
         elif (
@@ -360,19 +403,19 @@ class AIWorker(QObject):
 
         out = session.run(None, {input_name: input_tensor})[0]
 
-        # OpenCV/NumPy prefieren trabajar en FP32, convertimos la salida de vuelta
+        # Reconvertir salida a FP32 para OpenCV
         if out.dtype == np.float16:
             out = out.astype(np.float32)
 
         return out
 
     def _process_rmbg(self, img_rgba, model_path, force_size=None):
-        # Normalizar ruta para evitar errores de codificación con caracteres especiales
+        # Normalizar ruta previniendo errores de caracteres especiales
         model_path = os.path.normpath(str(Path(model_path).resolve()))
         session = _load_model(model_path)
         h, w = img_rgba.shape[:2]
 
-        # PASO 1: Inspeccionar si el modelo tiene dimensiones fijas
+        # Inspeccionar dimensiones del modelo
         inp_shape = session.get_inputs()[0].shape
         fixed_h, fixed_w = None, None
 
@@ -384,9 +427,9 @@ class AIWorker(QObject):
             if isinstance(w_dim, int) and w_dim > 0:
                 fixed_w = w_dim
 
-        # PASO 2: Determinar el tamaño óptimo de redimensionamiento
+        # Determinar tamaño óptimo
         if fixed_h and fixed_w:
-            # Si el modelo ONNX exige un tamaño exacto (ej. 1024x1024), lo respetamos
+            # Respetar resolución exigida por ONNX
             target_h, target_w = fixed_h, fixed_w
             logger.info(
                 f"RMBG: Usando dimensiones rígidas del modelo: {target_h}x{target_w}"
@@ -394,7 +437,7 @@ class AIWorker(QObject):
         elif force_size:
             target_h = target_w = force_size
         else:
-            # Si el modelo es dinámico, aplicamos tu lógica de optimización de VRAM
+            # Aplicar optimización dinámica de VRAM
             max_dim = max(h, w)
             if max_dim > 2048:
                 target_size = 768
@@ -405,7 +448,7 @@ class AIWorker(QObject):
             target_h = target_w = target_size
 
         try:
-            # Redimensionamos la imagen al tamaño objetivo
+            # Ejecutar redimensionamiento a objetivo
             img_input = (
                 cv2.resize(img_rgba[:, :, :3], (target_w, target_h)).astype(np.float32)
                 / 255.0
@@ -429,9 +472,11 @@ class AIWorker(QObject):
             err_str, err_clean = _clean_exception_msg(e)
 
             logger.error(f"Error en RMBG: {err_str}")
+            sensor_log(f"EXCEPTION IN _process_rmbg: {str(e)}")
+            sensor_log(traceback.format_exc())
 
-            # 2. Análisis inteligente del error: ¿Es un problema de memoria?
-            # Detectamos códigos de VRAM agotada en DML (8007000E), fallos de DML genéricos que implican colapso de GPU
+            # Analizar si el error es de memoria
+            # Detectar códigos OOM en DML (8007000E)
             is_out_of_memory = (
                 "8007000e" in err_clean
                 or "memoria" in err_clean
@@ -442,17 +487,17 @@ class AIWorker(QObject):
             )
 
             if is_out_of_memory:
-                # Si el modelo es rígido, no podemos bajarle la resolución. Fallamos con estilo.
+                # Fallar controladamente si el modelo es rígido
                 if fixed_h:
                     vram_available = _get_vram_info()
-                    # Lanzamos el error usando la misma función de formateo amigable que ya tenías
+                    # Lanzar error formateado
                     raise RuntimeError(
                         "❌ LIMITACIÓN DE HARDWARE\n\n"
                         "El modelo actual requiere demasiada memoria y tu tarjeta gráfica no puede procesarlo.\n\n"
                         + _format_vram_warning(vram_available)
                     )
 
-                # Si el modelo es dinámico y falló, intentamos reintentar con la mitad del tamaño (Fallback)
+                # Reintentar con mitad de tamaño si es dinámico
                 elif target_h > 256:
                     logger.warning(
                         f"RMBG: Insuficiente VRAM. Reintentando con {target_h // 2}"
@@ -461,7 +506,7 @@ class AIWorker(QObject):
                         img_rgba, model_path, force_size=target_h // 2
                     )
 
-            # 3. Si no es de memoria o ya agotamos los fallbacks, lanzamos un error general limpio
+            # Lanzar error general limpio
             raise RuntimeError(
                 "❌ ERROR EN PROCESAMIENTO DE IA\n\n"
                 "Ocurrió un error inesperado al procesar la imagen.\n"
@@ -504,44 +549,51 @@ class AIWorker(QObject):
         session = _load_model(model_path)
         h, w = img_rgba.shape[:2]
         
-        # MoGe ViTS funciona bien a 518x518 (múltiplo de parche ViT de 14)
+        # Fijar resolución a 518x518 para MoGe ViTS
         img_resized = cv2.resize(
             img_rgba[:, :, :3], (518, 518), interpolation=cv2.INTER_CUBIC
         )
 
         self.progress.emit(50, 100)
 
-        # Normalización típica ImageNet para modelos ViT
+        # Aplicar normalización ImageNet
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         img_input = (img_resized.astype(np.float32) / 255.0 - mean) / std
         tensor = np.expand_dims(np.transpose(img_input, (2, 0, 1)), axis=0)
 
-        # MoGe ViTS requiere input_tokens, lo calculamos para el tamaño de 518 (patch de 14x14)
+        # Calcular input_tokens para patch 14x14
         num_tokens = np.array(1369, dtype=np.int64) # (518 // 14) * (518 // 14) = 37 * 37 = 1369
         
-        output = session.run(None, {
+        out_names = [o.name for o in session.get_outputs()]
+        outputs = session.run(None, {
             "image": tensor,
             "num_tokens": num_tokens
         })
         
-        # El output de mapas normales en MoGe está en el índice 1 y su shape es (1, H, W, 3)
-        normals = output[1][0] # Extraemos el batch, quedando (H, W, 3)
+        # Buscar dinámicamente el output 'normal'
+        normal_idx = next((i for i, name in enumerate(out_names) if 'normal' in name.lower()), 1)
+        normals = outputs[normal_idx][0]
         
-        # Si quedó como (3, H, W), lo pasamos a (H, W, 3) por seguridad
+        # Transponer a (H, W, 3) por seguridad
         if normals.shape[0] == 3 and normals.shape[2] != 3:
             normals = np.transpose(normals, (1, 2, 0))
+            
+        # --- CORRECCIÓN DE ESPACIO DE COORDENADAS ---
+        # Convertir de OpenCV a Tangent Space (OpenGL)
+        normals[:, :, 1] = -normals[:, :, 1]  # Invertimos Y (Verde)
+        normals[:, :, 2] = -normals[:, :, 2]  # Invertimos Z (Azul - CRÍTICO)
         
-        # Escalar de [-1, 1] a [0, 255]
+        # Escalar a [0, 255]
         normals = np.clip(normals, -1.0, 1.0)
         normals_rgb = ((normals + 1.0) / 2.0 * 255).astype(np.uint8)
 
-        # Redimensionar al tamaño original
+        # Restaurar resolución original
         normals_resized = cv2.resize(
             normals_rgb, (w, h), interpolation=cv2.INTER_LINEAR
         )
         
-        # Añadir canal Alpha original si existe
+        # Restaurar canal Alpha
         if img_rgba.shape[2] == 4:
             alpha_channel = img_rgba[:, :, 3]
         else:
@@ -549,16 +601,34 @@ class AIWorker(QObject):
             
         return np.dstack((normals_resized, alpha_channel))
 
+    def _process_sam_encode(self, img_rgba, model_path):
+        """Calcula el embedding de MobileSAM usando el Encoder (corre una vez)."""
+        session = _load_model(model_path)
+        
+        # Ejecutar redimensionamiento a 1024x1024 para MobileSAM
+        img_resized = cv2.resize(
+            img_rgba[:, :, :3], (1024, 1024), interpolation=cv2.INTER_CUBIC
+        )
+
+        self.progress.emit(50, 100)
+
+        img_input = img_resized.astype(np.float32)
+        
+        output = session.run(None, {"input_image": img_input})
+        embedding = output[0] # (1, 256, 64, 64)
+        
+        return embedding
+
     def _process_upscale_tiled(
         self, img_rgba, model_path, force_fixed_dim=None, force_batch_size=1
     ):
-        # Normalizar ruta para evitar errores de codificación con caracteres especiales
+        # Normalizar ruta previniendo errores de caracteres especiales
         model_path = os.path.normpath(str(Path(model_path).resolve()))
         session = _load_model(model_path)
         img_rgb = img_rgba[:, :, :3]
         h, w = img_rgb.shape[:2]
 
-        # Detectar escala desde el nombre del archivo (ahora con encoding limpio)
+        # Extraer escala desde nombre de archivo
         name_lower = os.path.basename(model_path).lower()
         if "x1" in name_lower or "1x" in name_lower:
             scale = 1
@@ -569,16 +639,19 @@ class AIWorker(QObject):
         else:
             scale = 4
 
-        # PASO 1: Inspeccionar la forma de entrada del modelo
+        # Detectar CodeFormer (requiere normalización [-1, 1])
+        is_codeformer = "codeformer" in name_lower
+
+        # Inspeccionar forma de entrada
         inp_shape = session.get_inputs()[0].shape
         logger.info(f"Forma de entrada del modelo: {inp_shape}")
 
-        # Detectar dimensiones rígidas y batch size
+        # Detectar dimensiones rígidas y batch
         fixed_batch = None
         fixed_h, fixed_w = None, None
 
         if len(inp_shape) >= 4:
-            # inp_shape es una lista que puede contener int, str o None
+            # Manejar inp_shape con tipos mixtos (int, str, None)
             # Ejemplo para modelos dinámicos: [1, 3, 'H', 'W'] o ['batch', 3, 'H', 'W']
             # Ejemplo para RGT: [16, 3, 256, 256] o similar
 
@@ -586,7 +659,7 @@ class AIWorker(QObject):
             h_dim = inp_shape[2]
             w_dim = inp_shape[3]
 
-            # Si son números enteros, son dimensiones fijas
+            # Confirmar dimensiones fijas
             if isinstance(batch_dim, int) and batch_dim > 0 and batch_dim != 1:
                 fixed_batch = batch_dim
                 logger.info(f"Batch size rígido detectado: {fixed_batch}")
@@ -597,26 +670,26 @@ class AIWorker(QObject):
                     f"Dimensiones de tile rígidas detectadas: {fixed_h}x{fixed_w}"
                 )
 
-        # Aplicar forzados (por fallback después de error)
+        # Aplicar forzados tras fallback
         if force_fixed_dim:
             fixed_h = fixed_w = force_fixed_dim
         if force_batch_size and force_batch_size > 1:
             fixed_batch = force_batch_size
 
-        # PASO 2: Usar batch size fijo si está disponible
+        # Usar batch size fijo
         batch_size = fixed_batch if fixed_batch else 1
 
         # ======================================================================
-        # PASO 3: Configurar el mosaico adaptativo (Arquitectura de Tensor Fijo)
+        # Configurar mosaico adaptativo
         # ======================================================================
         tile_pad = 16
 
         if fixed_h and fixed_w:
-            # Si el modelo tiene un tamaño exigido por defecto
+            # Respetar tamaño exigido
             tensor_h, tensor_w = fixed_h, fixed_w
             batch_size = fixed_batch if fixed_batch else 1
         else:
-            # Si el modelo miente y dice ser dinámico, le FORZAMOS un tamaño estándar
+            # Forzar tamaño estándar para modelos pseudo-dinámicos
             vram_libre = _get_vram_info()
             if vram_libre is not None:
                 if vram_libre >= 20.0:
@@ -631,14 +704,14 @@ class AIWorker(QObject):
                 tensor_h = tensor_w = 256
             batch_size = 1
 
-        # El avance real del mosaico es el tamaño del tensor MENOS los bordes superpuestos
+        # Calcular avance real (tamaño menos overlap)
         tile_size_h = max(16, tensor_h - 2 * tile_pad)
         tile_size_w = max(16, tensor_w - 2 * tile_pad)
 
-        # Truco Maestro: Inyectamos el tamaño del tensor como fixed_h/w
-        # Esto obliga al Paso 4 a rellenar TODOS los mosaicos para que midan exactamente esto
+        # Inyectar tamaño de tensor en fixed_h/w
+        # Forzar relleno exacto de mosaicos
         fixed_h, fixed_w = tensor_h, tensor_w
-        # PASO 4: Recopilar todos los tiles primero
+        # Recopilar tiles
         tiles_data = []
         for y in range(0, h, tile_size_h):
             for x in range(0, w, tile_size_w):
@@ -655,16 +728,19 @@ class AIWorker(QObject):
                     ph = max(0, fixed_h - orig_th)
                     pw = max(0, fixed_w - orig_tw)
                 else:
-                    # Modelos avanzados (SwinIR, HAT, RealESRGAN) requieren múltiplos de 64
-                    # debido a sus jerarquías de downsampling/ventanas de atención profunda.
+                    # Asegurar múltiplos de 64 para modelos avanzados
+                    # Cumplir requisitos de atención/downsampling
                     ph = (64 - orig_th % 64) % 64
                     pw = (64 - orig_tw % 64) % 64
 
                 if ph > 0 or pw > 0:
                     tile = cv2.copyMakeBorder(tile, 0, ph, 0, pw, cv2.BORDER_REFLECT)
 
-                # Formato (3, H, W) float32 (Manteniendo RGB nativo, sin invertir)
-                t_arr = np.transpose(tile.astype(np.float32) / 255.0, (2, 0, 1))
+                # Formatear a (3, H, W) float32 RGB
+                t_arr = tile.astype(np.float32) / 255.0
+                if is_codeformer:
+                    t_arr = (t_arr - 0.5) / 0.5
+                t_arr = np.transpose(t_arr, (2, 0, 1))
                 tiles_data.append(
                     {
                         "tensor": t_arr,
@@ -683,13 +759,13 @@ class AIWorker(QObject):
         current_tile = 0
         output_img = np.zeros((h * scale, w * scale, 3), dtype=np.uint8)
 
-        # PASO 5: PROCESAR EN LOTES (BATCHES) CON TAMAÑO RÍGIDO SI ES NECESARIO
+        # Procesar lotes con tamaño rígido
         try:
             for i in range(0, total_tiles, batch_size):
                 batch_meta = tiles_data[i : i + batch_size]
                 batch_tensors = [t["tensor"] for t in batch_meta]
 
-                # Si el modelo requiere un batch size rígido, rellenamos con copias del primer tensor
+                # Rellenar batch rígido con copias
                 if batch_size > 1 and len(batch_tensors) < batch_size:
                     padding_needed = batch_size - len(batch_tensors)
                     logger.debug(
@@ -697,15 +773,17 @@ class AIWorker(QObject):
                     )
                     batch_tensors.extend([batch_tensors[0]] * padding_needed)
 
-                # Apilar todos los tensores en la dimensión 0. Shape: (Batch, 3, H, W)
+                # Apilar tensores en dimensión 0
                 tensor_batch = np.stack(batch_tensors, axis=0)
                 logger.debug(f"Batch shape: {tensor_batch.shape}")
 
                 out_batch = self._run_onnx(session, tensor_batch)
 
-                # Procesar la salida y escribir en la imagen final
+                # Escribir salida procesada en imagen final
                 for b_idx, meta in enumerate(batch_meta):
                     out = out_batch[b_idx]  # Extraer el resultado individual del batch
+                    if is_codeformer:
+                        out = (out + 1.0) / 2.0
                     out_np = np.clip(out.transpose(1, 2, 0) * 255, 0, 255).astype(
                         np.uint8
                     )
@@ -734,7 +812,7 @@ class AIWorker(QObject):
 
             logger.error(f"Error en upscale tiling: {err_str}")
 
-            # Detectar errores de memoria (VRAM insuficiente)
+            # Detectar OOM
             if (
                 "memoria" in err_clean
                 or "memory" in err_clean
@@ -742,20 +820,20 @@ class AIWorker(QObject):
             ):
                 vram_available = _get_vram_info()
 
-                # Si el fallback es la primera vez
+                # Intentar primer fallback
                 if not force_fixed_dim or force_fixed_dim > 128:
                     logger.warning("Insuficiente VRAM. Fallback: tiles de 128x128")
                     return self._process_upscale_tiled(
                         img_rgba, model_path, force_fixed_dim=128, force_batch_size=1
                     )
 
-                # Si ya estábamos en fallback, lanzar error clara
+                # Lanzar error claro si falla el fallback
                 raise RuntimeError(
                     "❌ LIMITACIÓN DE HARDWARE\n\n"
                     + _format_vram_warning(vram_available)
                 )
 
-            # Detectar errores de shape, "incompatible dimensions" o fallos de parámetros de DirectML (80070057)
+            # Detectar errores de dimensiones o fallo DirectML
             if (
                 "shape mismatch" in err_clean
                 or "reshape" in err_clean
@@ -768,12 +846,12 @@ class AIWorker(QObject):
                     logger.warning(
                         "Fallback automático: Conflicto geométrico en el grafo. Probando mosaico rígido seguro de 512x512"
                     )
-                    # Reintentamos con un tamaño de 512x512 y batch_size de 1 para máxima seguridad
+                    # Reintentar en modo ultra seguro (512x512, batch 1)
                     return self._process_upscale_tiled(
                         img_rgba, model_path, force_fixed_dim=512, force_batch_size=1
                     )
 
-            # Error genérico - mostrar el error técnico real
+            # Mostrar error técnico original
             raise RuntimeError(
                 f"❌ ERROR EN PROCESAMIENTO DE IA\n\n"
                 f"Error técnico: {err_str}\n\n"
@@ -783,7 +861,7 @@ class AIWorker(QObject):
                 f"• Revisa los logs para más detalles"
             )
 
-        # Restaurar canal alpha escalado (si existe)
+        # Restaurar canal alpha escalado
         if img_rgba.shape[2] == 4:
             alpha = cv2.resize(
                 img_rgba[:, :, 3],
@@ -797,7 +875,7 @@ class AIWorker(QObject):
 
 
 class ThumbnailLoaderThread(QThread):
-    # Emitimos un bloque (lista de diccionarios) en lugar de una por una
+    # Emitir lotes de descodificación en bloque
     thumbnail_loaded_batch = pyqtSignal(list)
     finished_loading = pyqtSignal(int)
 
@@ -837,6 +915,21 @@ class ThumbnailLoaderThread(QThread):
                             "h": height,
                             "ext": os.path.splitext(file_path)[1].lower(),
                         }
+
+                # Fallback con Pillow (AVIF / HEIC / etc.)
+                from core.utils import load_qimage_pillow
+                img, width, height = load_qimage_pillow(file_path, (140, 140))
+                if not img.isNull():
+                    return {
+                        "file": file,
+                        "file_path": file_path,
+                        "img": img,
+                        "size": os.path.getsize(file_path),
+                        "mtime": os.path.getmtime(file_path),
+                        "w": width,
+                        "h": height,
+                        "ext": os.path.splitext(file_path)[1].lower(),
+                    }
             except Exception as e:
                 logger.debug(f"Archivo ignorado/corrupto ({file}): {str(e)}")
             return None
@@ -844,11 +937,11 @@ class ThumbnailLoaderThread(QThread):
         import concurrent.futures
         import os
 
-        # Usar todos los núcleos disponibles para decodificar imágenes en paralelo
+        # Decodificar imágenes en paralelo multicore
         max_workers = min(32, (os.cpu_count() or 4) * 2)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # executor.map garantiza que los resultados se devuelven en el mismo orden original
+            # Garantizar retorno secuencial con executor.map
             for result in executor.map(load_single_image, self.image_files):
                 if not self._is_running:
                     break
@@ -860,7 +953,7 @@ class ThumbnailLoaderThread(QThread):
                         self.thumbnail_loaded_batch.emit(batch)
                         batch = []
 
-        # Emitir el remanente si quedó algo en el buffer
+        # Emitir remanente del buffer
         if batch and self._is_running:
             self.thumbnail_loaded_batch.emit(batch)
 
@@ -869,3 +962,74 @@ class ThumbnailLoaderThread(QThread):
 
     def stop(self):
         self._is_running = False
+
+
+class QuantizationWorker(QThread):
+    finished = pyqtSignal(QImage, int, list)
+
+    def __init__(self, qimage, num_colors=8, count_original=False):
+        super().__init__()
+        self.qimage = qimage
+        self.num_colors = max(2, min(256, num_colors))
+        self.count_original = count_original
+
+    def run(self):
+        try:
+            from PIL import Image
+
+            w, h = self.qimage.width(), self.qimage.height()
+            # Asegurar formato RGB888 o RGBA8888
+            fmt = self.qimage.format()
+            if fmt == QImage.Format.Format_RGBA8888:
+                src_qimg = self.qimage
+            elif fmt == QImage.Format.Format_RGB888:
+                src_qimg = self.qimage
+            else:
+                src_qimg = self.qimage.convertToFormat(QImage.Format.Format_RGBA8888)
+
+            ptr = src_qimg.bits()
+            ptr.setsize(src_qimg.sizeInBytes())
+
+            is_rgba = src_qimg.format() == QImage.Format.Format_RGBA8888
+            mode = "RGBA" if is_rgba else "RGB"
+            pil_img = Image.frombuffer(mode, (w, h), ptr, "raw", mode, 0, 1)
+
+            if is_rgba:
+                r, g, b, a = pil_img.split()
+                rgb_img = Image.merge("RGB", (r, g, b))
+            else:
+                rgb_img = pil_img.convert("RGB")
+
+            # Contar colores originales si se pide (solo primera vez)
+            original_color_count = -1
+            if self.count_original:
+                colors = rgb_img.getcolors(w * h)
+                if colors:
+                    original_color_count = len(colors)
+                else:
+                    original_color_count = w * h # Fallback
+
+            # Reducir paleta de colores usando Median Cut
+            quantized = rgb_img.quantize(colors=self.num_colors, method=0).convert("RGB")
+
+            # Extraer colores resultantes
+            res_colors = quantized.getcolors(w * h)
+            hex_list = []
+            if res_colors:
+                # res_colors es una lista de (count, (R, G, B))
+                for _, color in res_colors:
+                    r_c, g_c, b_c = color
+                    hex_list.append(f"#{r_c:02x}{g_c:02x}{b_c:02x}")
+
+            if is_rgba:
+                quantized.putalpha(a)
+                res_data = quantized.tobytes("raw", "RGBA")
+                result_qimg = QImage(res_data, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+            else:
+                res_data = quantized.tobytes("raw", "RGB")
+                result_qimg = QImage(res_data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+
+            self.finished.emit(result_qimg, original_color_count, hex_list)
+        except Exception as e:
+            logger.error(f"Error en QuantizationWorker: {e}")
+            self.finished.emit(self.qimage, -1, [])

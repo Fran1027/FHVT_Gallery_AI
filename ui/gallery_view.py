@@ -79,7 +79,7 @@ class ImageDelegate(QStyledItemDelegate):
                 self.thumb_size,
             )
 
-            # DIBUJADO DIRECTO: El pixmap ya viene escalado desde el Thread
+            # Renderizar pixmap directamente (ya pre-escalado)
             px = target_rect.x() + (target_rect.width() - pixmap.width()) // 2
             py = target_rect.y() + (target_rect.height() - pixmap.height()) // 2
 
@@ -157,11 +157,11 @@ class GroupListWidget(QListView):
         if viewport_w <= 0:
             viewport_w = self.width()
 
-        # Cuántas columnas caben
+        # Calcular columnas adaptativas
         columns = max(1, viewport_w // (item_w + self.spacing()))
-        # Filas necesarias
+        # Calcular filas requeridas
         rows = math.ceil(items_count / columns)
 
-        # Altura = (Filas * Alto) + Espaciados + Margen
+        # Calcular altura total necesaria del viewport
         total_h = (rows * item_h) + (rows * self.spacing()) + 15
         self.setFixedHeight(int(total_h))

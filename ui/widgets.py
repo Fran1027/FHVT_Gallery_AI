@@ -9,6 +9,9 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QPushButton,
+    QHBoxLayout,
+    QSpinBox,
+    QFrame
 )
 from PyQt6.QtGui import QPixmap, QFont, QPainter, QColor, QPen, QBrush
 from PyQt6.QtCore import Qt, QRect, QRectF, QPoint, QPointF, pyqtSignal, QTimer
@@ -562,6 +565,12 @@ class FullScreenViewer(ZoomableViewer):
             self.setPixmap(pix)
         self.showFullScreen()
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
+
 class DevDiagnosticWidget(QWidget):
     """Widget de diagnóstico en tiempo real para entornos de desarrollo."""
 
@@ -609,3 +618,127 @@ class DevDiagnosticWidget(QWidget):
             self.close()
         else:
             super().keyPressEvent(event)
+
+
+class QuantizeControlsWidget(QFrame):
+    """Widget de controles para Cuantización de Colores.
+    Se integra en el panel de resultados."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("""
+            QFrame {
+                background: transparent;
+            }
+            QLabel {
+                color: white;
+                font-size: 13px;
+                font-family: 'Inter', 'Segoe UI';
+            }
+            QSpinBox {
+                background-color: #2b2b2b;
+                color: white;
+                border: 1px solid #444;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid #999999;
+                height: 8px;
+                background: #1e1e1e;
+                margin: 2px 0;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #007acc;
+                border: 1px solid #005a9e;
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+
+        # 1. Top info layout (Stats)
+        self.stats_layout = QHBoxLayout()
+        self.lbl_original_count = QLabel("Colores Origen: Calculando...")
+        self.lbl_result_count = QLabel("Colores Finales: -")
+        self.lbl_original_count.setStyleSheet("color: #aaaaaa; font-weight: bold;")
+        self.lbl_result_count.setStyleSheet("color: #00ff41; font-weight: bold;")
+        self.stats_layout.addWidget(self.lbl_original_count)
+        self.stats_layout.addSpacing(20)
+        self.stats_layout.addWidget(self.lbl_result_count)
+        self.stats_layout.addStretch()
+
+        # 2. Controls Layout (Slider & SpinBox)
+        self.controls_layout = QHBoxLayout()
+        self.lbl_title = QLabel("Cantidad:")
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(2, 64)
+        self.slider.setValue(8)
+        self.slider.setFixedWidth(150)
+        
+        self.spin = QSpinBox()
+        self.spin.setRange(2, 64)
+        self.spin.setValue(8)
+        self.spin.setFixedWidth(50)
+
+        # Sync
+        self.slider.valueChanged.connect(self.spin.setValue)
+        self.spin.valueChanged.connect(self.slider.setValue)
+
+        self.controls_layout.addWidget(self.lbl_title)
+        self.controls_layout.addWidget(self.slider)
+        self.controls_layout.addWidget(self.spin)
+        self.controls_layout.addStretch()
+
+        # 3. Hex Colors Layout
+        self.hex_container = QWidget()
+        self.hex_layout = QHBoxLayout(self.hex_container)
+        self.hex_layout.setContentsMargins(0, 5, 0, 0)
+        self.hex_layout.setSpacing(5)
+        self.hex_container.setVisible(False) # Solo visible si <= 20
+
+        layout.addLayout(self.stats_layout)
+        layout.addLayout(self.controls_layout)
+        layout.addWidget(self.hex_container)
+
+    def set_stats(self, original_count, result_count, hex_list):
+        if original_count > 0:
+            self.lbl_original_count.setText(f"Colores Origen: {original_count:,}")
+        
+        self.lbl_result_count.setText(f"Colores Finales: {result_count:,}")
+
+        # Limpiar layout de colores hex
+        while self.hex_layout.count():
+            item = self.hex_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if hex_list and len(hex_list) <= 20:
+            self.hex_container.setVisible(True)
+            for hx in hex_list:
+                w = QFrame()
+                w.setFixedSize(16, 16)
+                w.setStyleSheet(f"background-color: {hx}; border: 1px solid #555; border-radius: 3px;")
+                w.setToolTip(hx)
+                
+                # Opcional: mostrar texto al lado del cuadrito si es muy poco, o solo tooltips
+                lbl_h = QLabel(hx)
+                lbl_h.setStyleSheet("font-size: 10px; color: #ccc;")
+                
+                pair_layout = QHBoxLayout()
+                pair_layout.setContentsMargins(0,0,5,0)
+                pair_layout.setSpacing(2)
+                pair_layout.addWidget(w)
+                # pair_layout.addWidget(lbl_h) # Se vería muy apretado con muchos, mejor solo tooltip
+                
+                wrapper = QWidget()
+                wrapper.setLayout(pair_layout)
+                self.hex_layout.addWidget(wrapper)
+            self.hex_layout.addStretch()
+        else:
+            self.hex_container.setVisible(False)

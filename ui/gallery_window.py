@@ -25,7 +25,7 @@ from PyQt6.QtCore import Qt, QFileSystemWatcher, QTimer
 from qfluentwidgets import setTheme, Theme, PrimaryPushButton
 
 from studio_logger import log_action, logger
-from core.utils import format_size
+from core.utils import format_size, load_pixmap_safely
 import core.file_manager as fm
 
 from core.threads import ThumbnailLoaderThread
@@ -33,6 +33,7 @@ from ui.gallery_view import GroupListWidget
 from ui.widgets import ZoomableViewer, FullScreenViewer, DevDiagnosticWidget
 from ui.styles import MAIN_STYLE, CONTEXT_MENU_STYLE
 from editor.image_tab import ImageTab
+from ui.log_console import LogConsoleDialog
 
 
 class ImageGallery(QMainWindow):
@@ -40,7 +41,7 @@ class ImageGallery(QMainWindow):
         super().__init__()
         setTheme(Theme.DARK)
         self.ignore_watcher = False
-        self.setWindowTitle("FHVT gallery")
+        self.setWindowTitle("FHVT Gallery AI")
         self.resize(1300, 800)
         self.setMinimumSize(1000, 680)
 
@@ -55,7 +56,7 @@ class ImageGallery(QMainWindow):
 
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setSingleShot(True)
-        self.refresh_timer.timeout.connect(self.load_images)
+        self.refresh_timer.timeout.connect(self.sync_directory_changes)
 
         self.dir_watcher = QFileSystemWatcher(self)
         self.dir_watcher.directoryChanged.connect(self.on_directory_changed)
@@ -105,6 +106,32 @@ class ImageGallery(QMainWindow):
         if not getattr(sys, 'frozen', False):
             self.dev_diag = DevDiagnosticWidget()
             sb.addPermanentWidget(self.dev_diag)
+            self.update_dev_diag_visibility()
+
+        self.btn_log_console = QPushButton("\ue9f9") # Icono log
+        self.btn_log_console.setFont(QFont("Segoe MDL2 Assets", 12))
+        self.btn_log_console.setToolTip("Consola de Logs")
+        self.btn_log_console.setStyleSheet("background: transparent; color: #aaa; border: none; padding: 2px;")
+        self.btn_log_console.clicked.connect(self.open_log_console)
+        sb.addPermanentWidget(self.btn_log_console)
+
+    def open_log_console(self):
+        self.log_console = LogConsoleDialog(self)
+        self.log_console.show()
+
+    def update_dev_diag_visibility(self):
+        if hasattr(self, 'dev_diag'):
+            from PyQt6.QtCore import QSettings
+            settings = QSettings("FHVT_Studio", "ImageEditor")
+            show = settings.value("show_dev_diag", True, type=bool)
+            self.dev_diag.setVisible(show)
+
+    def show_settings_dialog(self):
+        from ui.settings_dialog import SettingsDialog
+        from PyQt6.QtWidgets import QDialog
+        dialog = SettingsDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.update_dev_diag_visibility()
 
     def _rotate_spinner(self):
         self.lbl_spinner.setText(self.spinner_frames[self.spinner_idx])
@@ -115,6 +142,13 @@ class ImageGallery(QMainWindow):
             widget = self.tabs.widget(index)
             self.tabs.removeTab(index)
             if widget:
+                # Destruir físicamente el archivo temporal de IA si la pestaña se cierra (X)
+                if hasattr(widget, "ai_preview_source_path") and widget.ai_preview_source_path:
+                    if hasattr(widget, "file_path") and os.path.exists(widget.file_path):
+                        try:
+                            os.remove(widget.file_path)
+                        except Exception:
+                            pass
                 widget.deleteLater()
 
     def _create_action_menu(self, options, callback):
@@ -131,17 +165,6 @@ class ImageGallery(QMainWindow):
         toolbar_layout.setContentsMargins(15, 10, 15, 10)
         icon_font = QFont("Segoe MDL2 Assets", 14)
 
-        self.btn_open_new_tab = QPushButton("\ue8b9")
-        self.btn_open_new_tab.setToolTip("Abrir en nueva pestaña")
-        self.btn_open_new_tab.clicked.connect(self.open_selected_in_new_tab)
-
-        self.btn_fullscreen = QPushButton("\ue740")
-        self.btn_fullscreen.setToolTip("Pantalla completa")
-        self.btn_fullscreen.clicked.connect(self.fullscreen_preview)
-
-        self.btn_properties = QPushButton("\ue946")
-        self.btn_properties.setToolTip("Propiedades")
-        self.btn_properties.clicked.connect(self.open_windows_properties)
         self.path_edit = QLineEdit()
         self.path_edit.setReadOnly(True)
         self.path_edit.setPlaceholderText("Selecciona una carpeta...")
@@ -171,34 +194,32 @@ class ImageGallery(QMainWindow):
         self.btn_sort.setEnabled(False)
         self.btn_sort_order.setEnabled(False)
         self.btn_group.setEnabled(False)
-        self.btn_open_new_tab.setEnabled(False)
-        self.btn_fullscreen.setEnabled(False)
-        self.btn_properties.setEnabled(False)
 
         self.btn_open_folder = PrimaryPushButton("\ue838")
         self.btn_open_folder.setToolTip("Abrir carpeta")
         self.btn_open_folder.clicked.connect(self.open_folder_dialog)
 
+        self.btn_settings = QPushButton("\ue713") # Gear icon
+        self.btn_settings.setToolTip("Configuración")
+        self.btn_settings.setStyleSheet("QPushButton { border: 1px solid #333; border-radius: 4px; background: transparent; color: #aaa; } QPushButton:hover { color: #fff; background: #333; }")
+        self.btn_settings.clicked.connect(self.show_settings_dialog)
+
         for btn in [
-            self.btn_open_new_tab,
-            self.btn_fullscreen,
-            self.btn_properties,
             self.btn_sort_order,
             self.btn_open_folder,
+            self.btn_settings,
         ]:
             btn.setFont(icon_font)
             btn.setFixedSize(36, 36)
         self.btn_open_folder.setFixedWidth(50)
 
         for w in [
-            self.btn_open_new_tab,
-            self.btn_fullscreen,
-            self.btn_properties,
             self.path_edit,
             self.btn_sort,
             self.btn_sort_order,
             self.btn_group,
             self.btn_open_folder,
+            self.btn_settings,
         ]:
             toolbar_layout.addWidget(w)
         nav_layout.addLayout(toolbar_layout)
@@ -244,6 +265,15 @@ class ImageGallery(QMainWindow):
         self.gallery_left_widget.setMinimumWidth(max(250, int(width * 0.18)))
         self.viewer_container.setMinimumWidth(max(450, int(width * 0.42)))
 
+    def closeEvent(self, event):
+        if self.loader_thread and self.loader_thread.isRunning():
+            self.loader_thread.stop()
+            self.loader_thread.wait()
+            
+        event.accept()
+        # Forzar terminación del proceso para matar hilos zombis o watchers en modo dist
+        os._exit(0)
+
     def toggle_sort_order(self):
         sort_name = getattr(self, "current_sort", "Nombre")
         if sort_name == "Al Azar":
@@ -285,7 +315,7 @@ class ImageGallery(QMainWindow):
         self.dir_watcher.addPath(folder_path)
         self.path_edit.setText(folder_path)
         self.btn_open_folder.setStyleSheet("")
-        self.load_images()
+        self.load_all_images()
 
     def on_directory_changed(self, path):
         if not self.ignore_watcher:
@@ -305,8 +335,67 @@ class ImageGallery(QMainWindow):
 
         self._update_status_bar()
 
+    @log_action("Sincronizando cambios de directorio")
+    def sync_directory_changes(self):
+        if not os.path.exists(self.current_folder):
+            return self.load_all_images()
+
+        valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".avif", ".heic", ".heif"}
+        current_files_info = {}
+        try:
+            for entry in os.scandir(self.current_folder):
+                if entry.is_file():
+                    _, ext = os.path.splitext(entry.name)
+                    if ext.lower() in valid_exts:
+                        current_files_info[entry.name] = entry.stat().st_mtime
+        except Exception as e:
+            logger.error(f"Error escaneando carpeta: {str(e)}")
+            return
+
+        loaded_files_info = {d["file"]: d["mtime"] for d in self.all_images_data}
+        
+        added_files = []
+        removed_files = set()
+        modified_files = set()
+
+        for fname, mtime in current_files_info.items():
+            if fname not in loaded_files_info:
+                added_files.append(fname)
+            elif mtime > loaded_files_info[fname]:
+                # Modificado (tratamos como removido y luego agregado)
+                modified_files.add(fname)
+                added_files.append(fname)
+
+        for fname in loaded_files_info:
+            if fname not in current_files_info or fname in modified_files:
+                removed_files.add(fname)
+
+        if not added_files and not removed_files:
+            return
+
+        # Purga de RAM
+        if removed_files:
+            self.all_images_data = [d for d in self.all_images_data if d["file"] not in removed_files]
+
+        if added_files:
+            if self.loader_thread and self.loader_thread.isRunning():
+                self.load_all_images()
+                return
+
+            self.total_to_load = len(self.all_images_data) + len(added_files)
+            self.viewer.setText(f"Cargando {len(added_files)} nuevas imágenes...")
+            self.lbl_load_text.setText(f"Cargando: {len(self.all_images_data)} / {self.total_to_load}")
+            self.spinner_timer.start(100)
+
+            self.loader_thread = ThumbnailLoaderThread(self.current_folder, added_files)
+            self.loader_thread.thumbnail_loaded_batch.connect(self.on_thumbnail_batch_loaded)
+            self.loader_thread.finished_loading.connect(self.render_gallery)
+            self.loader_thread.start()
+        else:
+            self.render_gallery()
+
     @log_action("Cargando imágenes del disco")
-    def load_images(self):
+    def load_all_images(self):
         if self.loader_thread:
             self.loader_thread.stop()
             self.loader_thread.wait()
@@ -322,7 +411,7 @@ class ImageGallery(QMainWindow):
             self.viewer.setText("Vista Previa\n\nSeleccione carpeta")
             return
 
-        valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".avif", ".heic", ".heif"}
         image_files = []
         try:
             for entry in os.scandir(self.current_folder):
@@ -388,9 +477,6 @@ class ImageGallery(QMainWindow):
             self.btn_sort.setEnabled(False)
             self.btn_sort_order.setEnabled(False)
             self.btn_group.setEnabled(False)
-            self.btn_open_new_tab.setEnabled(False)
-            self.btn_fullscreen.setEnabled(False)
-            self.btn_properties.setEnabled(False)
             self._update_status_bar()
             return
 
@@ -514,9 +600,7 @@ class ImageGallery(QMainWindow):
         count = len(indexes)
 
         # Estos botones solo tienen sentido si hay exactamente UNA imagen seleccionada
-        self.btn_open_new_tab.setEnabled(count == 1)
-        self.btn_fullscreen.setEnabled(count == 1)
-        self.btn_properties.setEnabled(count == 1)
+
 
         if count == 1:
             # Una sola imagen: Mostrar vista previa
@@ -545,10 +629,14 @@ class ImageGallery(QMainWindow):
         menu.setStyleSheet(CONTEXT_MENU_STYLE)
 
         act_open = None
+        act_fullscreen = None
+        act_details = None
         if count <= 3:
             act_open = menu.addAction(
                 f"Abrir ({count})" if count > 1 else "Abrir en pestaña"
             )
+            if count == 1:
+                act_fullscreen = menu.addAction("Abrir en pantalla completa")
             menu.addSeparator()
 
         act_copy = menu.addAction("Copiar")
@@ -557,6 +645,9 @@ class ImageGallery(QMainWindow):
         act_rename = menu.addAction("Renombrar")
         act_rename.setEnabled(count == 1)
         act_delete = menu.addAction("Mover a la papelera")
+        if count == 1:
+            menu.addSeparator()
+            act_details = menu.addAction("Detalles")
 
         act_select_all = None
         if count < total_items:
@@ -571,13 +662,19 @@ class ImageGallery(QMainWindow):
         if act_open and action == act_open:
             for idx in indexes:
                 self.on_item_double_clicked(idx)
+        elif act_fullscreen and action == act_fullscreen:
+            self.fullscreen_preview()
+        elif act_details and action == act_details:
+            from ui.details_dialog import DetallesDialog
+            dlg = DetallesDialog(paths[0], self)
+            dlg.exec()
         elif action in [act_copy, act_cut]:
             fm.copy_to_clipboard(paths, move=(action == act_cut))
         elif action == act_rename:
             self.ignore_watcher = True
             try:
                 if fm.show_rename_dialog(self, paths[0]):
-                    self.load_images()
+                    self.sync_directory_changes()
             finally:
                 self.ignore_watcher = False
         elif action == act_delete:
@@ -590,7 +687,7 @@ class ImageGallery(QMainWindow):
                 self.ignore_watcher = True
                 try:
                     fm.send_to_trash(paths)
-                    self.load_images()
+                    self.sync_directory_changes()
                 finally:
                     QTimer.singleShot(
                         300, lambda: setattr(self, "ignore_watcher", False)
@@ -649,8 +746,69 @@ class ImageGallery(QMainWindow):
                 return
         new_tab = ImageTab(file_path)
         new_tab.imageUpdated.connect(self._update_status_bar)
+        new_tab.navigateRequested.connect(lambda direction, tab=new_tab: self._on_tab_navigate_requested(tab, direction))
         idx = self.tabs.addTab(new_tab, os.path.basename(file_path))
         self.tabs.setCurrentIndex(idx)
+
+    def _on_tab_navigate_requested(self, tab, direction):
+        if not self.all_images_data:
+            return
+            
+        current_path = os.path.abspath(tab.file_path)
+        # Buscar el índice actual basado en el orden de la galería
+        current_index = -1
+        for i, img_data in enumerate(self.all_images_data):
+            if os.path.abspath(img_data["file_path"]) == current_path:
+                current_index = i
+                break
+                
+        if current_index == -1:
+            return  # No se encontró en la lista actual
+            
+        new_index = current_index - 1 if direction == "prev" else current_index + 1
+        
+        # Verificar límites
+        if new_index < 0 or new_index >= len(self.all_images_data):
+            return  # No hay más imágenes en esa dirección
+            
+        new_file_path = self.all_images_data[new_index]["file_path"]
+        
+        # Cerrar pestaña actual para liberar toda la RAM
+        tab_idx = self.tabs.indexOf(tab)
+        if tab_idx != -1:
+            self.close_tab(tab_idx)
+            
+        # Abrir nueva imagen en una nueva pestaña (que tomará el lugar de la anterior)
+        self.open_image_tab(new_file_path)
+
+    @log_action("Abriendo pestaña de vista previa de IA")
+    def open_ai_preview_tab(self, result_qimage, original_pixmap, source_file_path, ai_mode):
+        if self.tabs.count() >= 6:
+            QMessageBox.information(
+                self,
+                "Límite alcanzado",
+                "Has alcanzado el límite de 5 pestañas abiertas.\n\nCierra alguna para previsualizar el resultado de IA.",
+            )
+            return False
+
+        import time
+        from core.utils import get_base_path
+        temp_dir = os.path.join(get_base_path(), "scratch")
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"ai_preview_{int(time.time()*1000)}.png")
+        if not result_qimage.save(temp_path):
+            QMessageBox.critical(self, "Error", "No se pudo crear el archivo temporal de IA.")
+            return False
+
+        new_tab = ImageTab(temp_path)
+        new_tab.imageUpdated.connect(self._update_status_bar)
+        
+        tab_name = f"[*] {ai_mode.upper()} Preview"
+        idx = self.tabs.addTab(new_tab, tab_name)
+        self.tabs.setCurrentIndex(idx)
+        
+        new_tab.set_ai_preview_mode(result_qimage, original_pixmap, source_file_path, ai_mode)
+        return True
 
     @log_action("Vista previa pantalla completa")
     def fullscreen_preview(self, *_):
@@ -670,7 +828,56 @@ class ImageGallery(QMainWindow):
                 )
                 break
 
+    @log_action("Abriendo consola nativa")
+    def open_native_console(self, checked=False):
+        import sys
+        if getattr(sys, "frozen", False):
+            import ctypes
+            import logging
+            from studio_logger import LogcatFormatter, logger
+            
+            kernel32 = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
+            
+            # Intenta crear la consola, retorna falso si ya existe una
+            if kernel32.AllocConsole():
+                sys.stdout = open("CONOUT$", "w", encoding="utf-8")
+                sys.stderr = open("CONOUT$", "w", encoding="utf-8")
+                
+                # Habilitar secuencias ANSI (colores)
+                handle = kernel32.GetStdHandle(-11) # STD_OUTPUT_HANDLE
+                mode = ctypes.c_ulong()
+                kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+                mode.value |= 0x0004 # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                kernel32.SetConsoleMode(handle, mode)
+                
+                # Deshabilitar el botón (X) Cerrar para evitar cierres accidentales del proceso
+                hwnd = kernel32.GetConsoleWindow()
+                if hwnd:
+                    hMenu = user32.GetSystemMenu(hwnd, False)
+                    if hMenu:
+                        user32.RemoveMenu(hMenu, 0xF060, 0x0000) # SC_CLOSE
+                
+                # Enganchar el stream real con colores al logger
+                console_handler = logging.StreamHandler(sys.stdout)
+                console_handler.setFormatter(LogcatFormatter(use_colors=True))
+                logger.addHandler(console_handler)
+                
+                logger.info("Consola Nativa en tiempo real enganchada correctamente.")
+            else:
+                # Si ya está abierta, traerla al frente
+                hwnd = kernel32.GetConsoleWindow()
+                if hwnd:
+                    user32.SetForegroundWindow(hwnd)
+        else:
+            QMessageBox.information(
+                self, "Modo Desarrollo", 
+                "Estás corriendo el código fuente.\n\n"
+                "La consola real ya está activa en tu PowerShell o Terminal de VS Code.\n"
+                "Revisa allí para ver descargas, progreso y logs en tiempo real."
+            )
+
     @log_action("Mostrando vista previa")
     def display_preview(self, path):
-        pix = QPixmap(path)
+        pix = load_pixmap_safely(path)
         self.viewer.setPixmap(pix)

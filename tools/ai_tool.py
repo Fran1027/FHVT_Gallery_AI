@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from huggingface_hub import hf_hub_download
 from studio_logger import log_action, logger
 from core.utils import get_base_path
 
@@ -308,45 +307,84 @@ MODELS_CONFIG = {
         "full_utility": "Mapa de Normales (Normal Map)",
         "desc": "Estima los vectores 3D de la superficie (XYZ) a partir de una foto 2D. Produce la clásica imagen azul/morada usada para iluminar mallas 3D de bajos polígonos. Ultraligero.",
     },
+    # --- EXTRACCIÓN INTERACTIVA ---
+    "MobileSAM": {
+        "repo": "PulpCut/mobilesam-onnx",
+        "file": "mobilesam.encoder.onnx",
+        "extra_files": ["mobilesam.decoder.onnx"],
+        "path": "models/sam/mobilesam.encoder.onnx",
+        "snapshot": False,
+        "cat": "sam",
+        "tier": "Lite",
+        "sub": "universal",
+        "full_sub": "MobileSAM ViT-Tiny",
+        "ram": "2 GB",
+        "vram": "1 GB",
+        "full_utility": "Segmentación Interactiva (SAM)",
+        "desc": "Aísla cualquier objeto de la imagen haciendo clic sobre él. Extremadamente rápido y preciso.",
+    },
 }
 
 
 class DownloadWorker(QThread):
     finished = pyqtSignal(bool, str)
+    progress = pyqtSignal(int, int)
 
     def __init__(self, config):
         super().__init__()
         self.cfg = config
+        self._is_cancelled = False
+        
+    def cancel(self):
+        self._is_cancelled = True
 
     @log_action("Descargando Modelo desde HuggingFace")
     def run(self):
+        import requests
         try:
             base = get_base_path()
             target_path = os.path.normpath(os.path.join(base, self.cfg["path"]))
             target_dir = os.path.dirname(target_path)
             os.makedirs(target_dir, exist_ok=True)
 
-            logger.info(f"Descargando: {self.cfg['repo']} -> {self.cfg['file']}")
-            downloaded_path = hf_hub_download(
-                repo_id=self.cfg["repo"],
-                filename=self.cfg["file"],
-                local_dir=target_dir,
-                local_dir_use_symlinks=False,
-            )
-            if os.path.normpath(downloaded_path) != target_path:
-                if os.path.exists(target_path):
-                    os.remove(target_path)
-                os.rename(downloaded_path, target_path)
-
+            files_to_download = [(self.cfg["repo"], self.cfg["file"], target_path)]
             if "extra_files" in self.cfg:
                 for ext_file in self.cfg["extra_files"]:
-                    logger.info(f"Descargando extra: {self.cfg['repo']} -> {ext_file}")
-                    hf_hub_download(
-                        repo_id=self.cfg["repo"],
-                        filename=ext_file,
-                        local_dir=target_dir,
-                        local_dir_use_symlinks=False,
-                    )
+                    ext_path = os.path.normpath(os.path.join(target_dir, ext_file))
+                    files_to_download.append((self.cfg["repo"], ext_file, ext_path))
+                    
+            for repo, filename, final_path in files_to_download:
+                if self._is_cancelled:
+                    break
+                    
+                url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+                logger.info(f"Descargando: {url} -> {final_path}")
+                
+                response = requests.get(url, stream=True)
+                response.raise_for_status()
+                total_size = int(response.headers.get('content-length', 0))
+                
+                part_path = final_path + ".part"
+                downloaded_size = 0
+                
+                with open(part_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024*1024):
+                        if self._is_cancelled:
+                            break
+                        if chunk:
+                            f.write(chunk)
+                            downloaded_size += len(chunk)
+                            self.progress.emit(downloaded_size, total_size)
+                            
+                if self._is_cancelled:
+                    if os.path.exists(part_path):
+                        os.remove(part_path)
+                    self.finished.emit(False, "Descarga cancelada.")
+                    return
+                    
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                os.rename(part_path, final_path)
 
             self.finished.emit(True, target_path)
         except Exception as e:
@@ -416,7 +454,7 @@ class ModelCard(QFrame):
         main_layout.setContentsMargins(20, 20, 20, 15)
         main_layout.setSpacing(15)
 
-        # CABECERA: Título y estado
+        # Configurar cabecera tarjeta
         v_header = QVBoxLayout()
         v_header.setSpacing(4)
         lbl_mod_tag = QLabel("MODALIDAD:")
@@ -436,11 +474,11 @@ class ModelCard(QFrame):
         v_header.addWidget(status_bar)
         main_layout.addLayout(v_header)
 
-        # CUERPO: Grid Híbrido (Descripción + Specs)
+        # Configurar cuerpo grid tarjeta
         h_body = QHBoxLayout()
         h_body.setSpacing(12)
 
-        # Izquierda: Caja de texto descriptivo
+        # Insertar caja descriptiva izquierda
         desc_box = QFrame()
         desc_box.setStyleSheet(
             "background-color: rgba(25, 25, 25, 0.5); border: 1px solid #252525; border-radius: 12px;"
@@ -460,7 +498,7 @@ class ModelCard(QFrame):
         desc_layout.addStretch()
         h_body.addWidget(desc_box, 1)
 
-        # Derecha: Columna de InfoBoxes
+        # Insertar InfoBoxes derecha
         v_specs = QVBoxLayout()
         v_specs.setSpacing(8)
         v_specs.addWidget(
@@ -473,20 +511,21 @@ class ModelCard(QFrame):
 
         main_layout.addLayout(h_body)
 
-        # FOOTER: Utilidad completa
+        # Configurar footer tarjeta
         lbl_foot = QLabel(config.get("full_utility", ""))
         lbl_foot.setStyleSheet("color: #0098ff; font-size: 10px; font-weight: bold;")
         lbl_foot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(lbl_foot)
 
-        # Estilo Dinámico basado en Propiedades
+        # Aplicar estilo CSS dinámico
         self.setProperty("installed", bool(exists))
         self.setProperty("selected", bool(is_selected))
         self.setStyleSheet(self.STATIC_STYLE)
 
-    def mousePressEvent(self, event):
-        self.clicked.emit(self.name)
-        super().mousePressEvent(event)
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.name)
+        super().mouseReleaseEvent(event)
 
 
 class FilterCapsule(QFrame):
@@ -523,7 +562,7 @@ class AIAdvancedDialog(QDialog):
         super().__init__(parent)
         self.actions = actions
         self.selected_model = None
-        self.setWindowTitle("FHVT gallery")
+        self.setWindowTitle("FHVT Gallery AI")
         self.setFixedSize(1150, 780)
 
         self.setStyleSheet("""
@@ -567,7 +606,7 @@ class AIAdvancedDialog(QDialog):
         self.combo_type = self.cap_type.combo
         self.cap_util = FilterCapsule("\ue713", "Utilidad")
         self.cap_util.combo.addItems(
-            ["Cualquiera", "Upscaling", "Restauración", "Quitar Fondo", "Profundidad", "Normal Map"]
+            ["Cualquiera", "Upscaling", "Restauración", "Quitar Fondo", "Profundidad", "Normal Map", "Segmentación Interactiva"]
         )
         self.combo_util = self.cap_util.combo
         self.cap_vram = FilterCapsule("\ue950", "Requisitos VRAM")
@@ -627,12 +666,16 @@ class AIAdvancedDialog(QDialog):
         self.btn_download = QPushButton("DESCARGAR ASSETS")
         self.btn_download.setObjectName("DownloadBtn")
         self.btn_download.setEnabled(False)
+        self.btn_cancel_download = QPushButton("CANCELAR DESCARGA")
+        self.btn_cancel_download.setObjectName("CancelBtn")
+        self.btn_cancel_download.hide()
         self.btn_execute = QPushButton("EJECUTAR TAREA IA")
         self.btn_execute.setObjectName("ExecuteBtn")
         self.btn_execute.setEnabled(False)
         footer.addWidget(self.btn_cancel)
         footer.addStretch()
         footer.addWidget(self.btn_delete)
+        footer.addWidget(self.btn_cancel_download)
         footer.addWidget(self.btn_download)
         footer.addWidget(self.btn_execute)
         main_layout.addLayout(footer)
@@ -653,6 +696,7 @@ class AIAdvancedDialog(QDialog):
         self.btn_cancel.clicked.connect(self.close)
         self.btn_delete.clicked.connect(self._delete_model)
         self.btn_download.clicked.connect(self._start_download)
+        self.btn_cancel_download.clicked.connect(self._cancel_download)
         self.btn_execute.clicked.connect(self._run_task_selected)
         self.btn_clear.clicked.connect(self._deselect_model)
         self._refresh_grid()
@@ -671,7 +715,7 @@ class AIAdvancedDialog(QDialog):
         filter_util = self.combo_util.currentText().lower()
         filter_vram = self.combo_vram.currentText().split(" ")[0].lower()
 
-        # Ordenar modelos por requisito de VRAM (de menor a mayor)
+        # Ordenar catálogo según VRAM (ascendente)
         def get_vram_mb(cfg):
             v_str = cfg.get("vram", "0 MB")
             return (
@@ -684,7 +728,7 @@ class AIAdvancedDialog(QDialog):
 
         col, row = 0, 0
         for name, cfg in sorted_models:
-            # 1. Filtro por Tipo (Realista/Anime)
+            # Filtrar por tipo artístico
             sub_cat = cfg.get("sub", "universal")
             type_map = {"realista": "real", "anime": "anime"}
             target_type = type_map.get(filter_type)
@@ -701,12 +745,13 @@ class AIAdvancedDialog(QDialog):
                 "quitar fondo": "rmbg",
                 "profundidad": "depth",
                 "normal map": "normal",
+                "segmentación interactiva": "sam",
             }
             target_util = util_map.get(filter_util)
             if filter_util != "cualquiera" and cfg["cat"] != target_util:
                 continue
 
-            # 3. Filtro por Requisitos (VRAM Real)
+            # Filtrar por requisitos técnicos VRAM
             if filter_vram != "cualquiera":
                 v_str = cfg["vram"]
                 v_mb = (
@@ -735,6 +780,17 @@ class AIAdvancedDialog(QDialog):
                 row += 1
         self.grid.setRowStretch(row + 1, 1)
 
+    def _update_card_styles(self):
+        """Actualiza los estilos visuales sin destruir la grilla."""
+        for i in range(self.grid.count()):
+            widget = self.grid.itemAt(i).widget()
+            if hasattr(widget, "name"):
+                is_selected = (widget.name == self.selected_model)
+                if widget.property("selected") != is_selected:
+                    widget.setProperty("selected", is_selected)
+                    widget.style().unpolish(widget)
+                    widget.style().polish(widget)
+
     def _on_model_selected(self, name):
         self.selected_model = name
         self.lbl_current.setText(name)
@@ -747,7 +803,7 @@ class AIAdvancedDialog(QDialog):
         self.btn_delete.setEnabled(exists)
         self.btn_execute.setEnabled(exists)
         self.btn_download.setEnabled(not exists)
-        self._request_refresh()
+        self._update_card_styles()
 
     def _deselect_model(self, *args):
         self.selected_model = None
@@ -759,7 +815,7 @@ class AIAdvancedDialog(QDialog):
         self.btn_delete.setEnabled(False)
         self.btn_execute.setEnabled(False)
         self.btn_download.setEnabled(False)
-        self._request_refresh()
+        self._update_card_styles()
 
     @log_action("Borrando Modelo IA")
     def _delete_model(self, *args):
@@ -795,22 +851,53 @@ class AIAdvancedDialog(QDialog):
         if not self.selected_model:
             return
         cfg = MODELS_CONFIG[self.selected_model]
-        self.btn_download.setEnabled(False)
-        self.pbar.setRange(0, 0)
+        self.scroll.setEnabled(False)  # Bloquear UI
+        self.btn_download.hide()
+        self.btn_cancel_download.show()
+        self.btn_delete.setEnabled(False)
+        self.btn_execute.setEnabled(False)
+        
+        self.pbar.setRange(0, 100)
+        self.pbar.setValue(0)
         self.pbar.show()
-        self.lbl_msg.setText(f"📥 Descargando {self.selected_model}...")
+        self.lbl_msg.setText("📥 Conectando...")
         self.worker = DownloadWorker(cfg)
+        self.worker.progress.connect(self._on_download_progress)
         self.worker.finished.connect(self._on_download_finished)
         self.worker.start()
 
+    def _cancel_download(self):
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.lbl_msg.setText("⛔ Cancelando...")
+            self.btn_cancel_download.setEnabled(False)
+            self.worker.cancel()
+
+    def _on_download_progress(self, downloaded, total):
+        from core.utils import format_size
+        if total > 0:
+            pct = int((downloaded / total) * 100)
+            self.pbar.setValue(pct)
+            self.lbl_msg.setText(f"📥 Descargando {self.selected_model}... ({format_size(downloaded)} / {format_size(total)})")
+        else:
+            self.lbl_msg.setText(f"📥 Descargando {self.selected_model}... ({format_size(downloaded)})")
+
     def _on_download_finished(self, success, msg):
         self.pbar.hide()
+        self.scroll.setEnabled(True)  # Desbloquear UI
+        self.btn_cancel_download.hide()
+        self.btn_cancel_download.setEnabled(True)
+        self.btn_download.show()
+        
         if success:
             self.lbl_msg.setText("✅ Descarga completa.")
             self._on_model_selected(self.selected_model)
         else:
-            self.lbl_msg.setText(f"❌ Error: {msg}")
-            self.btn_download.setEnabled(True)
+            if "cancelada" in msg.lower():
+                self.lbl_msg.setText("⛔ Descarga cancelada.")
+                self.btn_download.setEnabled(True)
+            else:
+                self.lbl_msg.setText(f"❌ Error: {msg}")
+                self.btn_download.setEnabled(True)
 
     def _run_task_selected(self, *args):
         if self.selected_model:
@@ -828,4 +915,6 @@ class AIAdvancedDialog(QDialog):
             self.actions.on_run_depth(rel_path)
         elif cfg["cat"] == "normal":
             self.actions.on_run_normal(rel_path)
+        elif cfg["cat"] == "sam":
+            self.actions.on_run_sam(rel_path)
         self.close()

@@ -16,29 +16,88 @@ from PyQt6.QtWidgets import (
     QColorDialog,
     QScrollArea,
     QGridLayout,
+    QGraphicsView,
+    QProgressBar,
 )
 from PyQt6.QtGui import QPixmap, QFont, QImage, QPainter, QColor, QUndoStack
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRect
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRect, QPoint, QEvent, QObject
 
-from qfluentwidgets import Flyout
+from qfluentwidgets import Flyout, CommandBar, Action, FluentIcon, RoundMenu
+from qfluentwidgets.components.widgets.command_bar import (
+    CommandButton,
+    CommandMenu,
+    MenuAnimationType,
+)
 
-from core.threads import AIWorker, PaletteWorker
+from core.threads import AIWorker, PaletteWorker, QuantizationWorker
 from core.generative import GenerativeAIWorker
 
 from studio_logger import log_action, logger
 
 from editor.commands import EditorCommand
-from ui.widgets import ZoomableViewer, ModernMediaSlider, FullScreenViewer
+from ui.widgets import ZoomableViewer, ModernMediaSlider, FullScreenViewer, QuantizeControlsWidget
 from editor.canvas_items import ColorMarker
-from tools.factory import make_btn, make_icon_btn
+from tools.factory import make_btn
 from tools.mirror_tool import MirrorTool
 from tools.ai_tool import AIAdvancedDialog
 from tools.generative_tool import GenerativeDialog
 from core.hardware import check_cuda_support
 from core.processing import apply_image_transformations
-from core.utils import excede_limite_megapixeles
+from core.utils import excede_limite_megapixeles, load_pixmap_safely
 from ui.panels.canvas_panel import CanvasToolsPanel
 from ui.panels.palette_panel import PaletteToolsPanel
+
+
+class MenuHoverFilter(QObject):
+    """Filtro que abre el submenú nativo de QToolButton cuando el cursor pasa por encima."""
+    def __init__(self, target_widget):
+        super().__init__(target_widget)
+        self.target_widget = target_widget
+
+    def eventFilter(self, obj, event):
+        if obj == self.target_widget and event.type() == QEvent.Type.Enter:
+            # Delegar la apertura al event loop para no interrumpir el evento actual
+            QTimer.singleShot(0, self._desplegar_menu)
+        return super().eventFilter(obj, event)
+
+    def _desplegar_menu(self):
+        menu = self.target_widget.menu()
+        if menu:
+            # Forzamos la aparición justo debajo del botón
+            x = 0
+            y = self.target_widget.height() + 2
+            pos_global = self.target_widget.mapToGlobal(QPoint(x, y))
+            menu.exec(pos_global)
+
+
+class SmartCommandBar(CommandBar):
+    """CommandBar inteligente que ajusta la posición del menú desplegable (...) hacia la derecha si está cerca del borde izquierdo."""
+    def _showMoreActionsMenu(self):
+        self.moreButton.clearState()
+
+        actions = self._hiddenActions.copy()
+        for w in reversed(self._hiddenWidgets):
+            if isinstance(w, CommandButton):
+                actions.insert(0, w.action())
+
+        menu = CommandMenu(self)
+        menu.addActions(actions)
+
+        x = -menu.width() + menu.layout().contentsMargins().right() + \
+            self.moreButton.width() + 18
+        if self._menuAnimation == MenuAnimationType.DROP_DOWN:
+            y = self.moreButton.height()
+        else:
+            y = -5
+
+        global_pos = self.moreButton.mapToGlobal(QPoint(x, y))
+        btn_global_x = self.moreButton.mapToGlobal(QPoint(0, 0)).x()
+
+        # Si el menú intentaría abrirse fuera de la pantalla por la izquierda (x < 0), desplegar hacia la derecha:
+        if global_pos.x() < 0 or global_pos.x() < btn_global_x:
+            global_pos.setX(max(10, btn_global_x))
+
+        menu.exec(global_pos, aniType=self._menuAnimation)
 
 
 class SwatchFrame(QFrame):
@@ -184,28 +243,120 @@ class EditorState(Enum):
     EDIT_SAVE = auto()
     EDIT_AI = auto()
     EDIT_MAGIC_ERASER = auto()
+    EDIT_QUANTIZE = auto()
 
+
+# ==============================================================================
+class GlobalAIOverlay(QWidget):
+    cancelClicked = pyqtSignal()
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("GlobalAIOverlay { background-color: rgba(0, 0, 0, 190); }")
+        self.hide()
+        
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(15)
+        
+        from qfluentwidgets import IndeterminateProgressRing
+        self.icon_label = QLabel("\ue9f5")
+        self.icon_label.setFont(QFont("Segoe MDL2 Assets", 48))
+        self.icon_label.setStyleSheet("color: white; background: transparent;")
+        self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.spinner = IndeterminateProgressRing()
+        self.spinner.setFixedSize(60, 60)
+        self.spinner.setStrokeWidth(5)
+        
+        self.title_label = QLabel("Procesando...")
+        self.title_label.setStyleSheet(
+            "font-size: 24px; font-weight: bold; color: white; background: transparent;"
+        )
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedSize(300, 6)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar { background-color: #2d2d2d; border: none; border-radius: 3px; }
+            QProgressBar::chunk { background-color: #007acc; border-radius: 3px; }
+        """)
+        
+        self.btn_cancel = QPushButton("CANCELAR PROCESO")
+        self.btn_cancel.setFixedSize(200, 35)
+        self.btn_cancel.setStyleSheet("""
+            QPushButton { background-color: rgba(255, 59, 59, 0.2); color: #ff3b3b; border: 1px solid #ff3b3b; border-radius: 6px; font-weight: bold; font-size: 12px; }
+            QPushButton:hover { background-color: #ff3b3b; color: white; }
+        """)
+        self.btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cancel.clicked.connect(self.cancelClicked.emit)
+        
+        layout.addStretch()
+        layout.addWidget(self.icon_label, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.spinner, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.btn_cancel, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch()
+
+    def setProgress(self, val, max_val):
+        self.progress_bar.setMaximum(max_val)
+        self.progress_bar.setValue(val)
+        
+    def show_processing(self, text):
+        self.icon_label.setVisible(True)
+        self.spinner.setVisible(True)
+        self.title_label.setVisible(True)
+        self.progress_bar.setVisible(True)
+        self.btn_cancel.setVisible(True)
+        self.title_label.setText(text)
+        self.progress_bar.setValue(0)
+        self.spinner.start()
+        self.show()
+        self.raise_()
+        
+    def show_review_mode(self):
+        self.icon_label.setVisible(False)
+        self.spinner.setVisible(False)
+        self.title_label.setVisible(False)
+        self.progress_bar.setVisible(False)
+        self.btn_cancel.setVisible(False)
+        self.spinner.stop()
+        self.show()
+        self.raise_()
+        
+    def hide_processing(self):
+        self.spinner.stop()
+        self.hide()
+        
+    def mousePressEvent(self, event):
+        event.accept()
 
 # ==============================================================================
 # --- CLASE PRINCIPAL: IMAGE TAB ---
 # ==============================================================================
 class ImageTab(QWidget):
     imageUpdated = pyqtSignal()
+    navigateRequested = pyqtSignal(str)  # "prev" o "next"
 
-    STYLE_DEFAULT = "QPushButton { background: transparent; border: 1px solid #fff; border-radius: 6px; color: #ccc; } QPushButton:disabled { color: #444; border-color: #2a2a2a; } QPushButton:hover:enabled { background: rgba(255,255,255,0.1); }"
-    STYLE_ACTIVE = "QPushButton { background: #007acc; border: 1px solid #007acc; border-radius: 6px; color: white; } QPushButton:disabled { background: #1a1a1a; color: #444; border-color: #2a2a2a; }"
+    global_ai_lock = False
 
     # --- INICIALIZACIÓN ---
     def __init__(self, file_path):
         super().__init__()
         self.setMinimumSize(900, 600)
+        self.ai_overlay = GlobalAIOverlay(self)
+        self.ai_overlay.cancelClicked.connect(self._cancel_ai_worker)
         self.file_path = file_path
         self.active_flyout = None
         self.angle = 0
         self.flip_h = False
         self.flip_v = False
         self.canvas_bg_color = Qt.GlobalColor.white
-        self.original_pixmap = QPixmap(file_path)
+        self.original_pixmap = load_pixmap_safely(file_path)
         self.brightness = 1.0
         self.contrast = 1.0
         self.canvas_L = 0
@@ -224,7 +375,9 @@ class ImageTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Toolbar
+        # --- REESTRUCTURACIÓN DE LA BARRA DE HERRAMIENTAS (SIN CommandBar) ---
+        from qfluentwidgets import TransparentToolButton, TransparentDropDownPushButton
+
         self.toolbar_container = QWidget()
         self.toolbar_container.setObjectName("toolbar_container")
         self.toolbar_container.setStyleSheet("""
@@ -234,94 +387,144 @@ class ImageTab(QWidget):
                 border-radius: 10px;
                 margin: 5px 10px;
             }
+            QToolButton {
+                background-color: transparent;
+                color: #ccc;
+                border-radius: 4px;
+                padding: 5px 8px;
+            }
+            QToolButton:hover { background-color: rgba(60, 60, 60, 0.9); color: white; }
+            QToolButton:checked { background-color: rgba(0, 122, 204, 0.6); color: white; border: 1px solid #007acc; }
         """)
         self.toolbar_layout = QHBoxLayout(self.toolbar_container)
         self.toolbar_layout.setContentsMargins(10, 5, 10, 5)
         self.toolbar_layout.setSpacing(6)
 
-        icon_font = QFont("Segoe MDL2 Assets", 14)
-        self.btn_fullscreen = make_btn(
-            "\ue740", "Pantalla Completa", icon_font, self.open_fullscreen
-        )
-        self.btn_edit = make_icon_btn(
-            "edit-image.png", "Editar Imagen", callback=self.toggle_edit_mode
-        )
-        self.btn_mirror = make_icon_btn(
-            "flip.png", "Opciones de Espejo", callback=self.toggle_mirror
-        )
-        self.btn_rotate = make_btn(
-            "\ue7ad", "Opciones de Giro", icon_font, self.toggle_rotate
-        )
-        self.btn_crop = make_btn(
-            "\ue7a8", "Recortar Imagen", icon_font, self.toggle_crop
-        )
-        self.btn_canvas = make_icon_btn(
-            "expand.png", "Ampliar Lienzo", callback=self.toggle_canvas
-        )
-        self.btn_adjust = make_btn(
-            "\ue706", "Brillo y Contraste", icon_font, self.toggle_adjust
-        )
-        self.btn_palette = make_btn(
-            "\ue790", "Extraer Paleta", icon_font, self.toggle_palette
-        )
-        self.btn_ai = make_icon_btn(
-            "artificial-intelligence.png", "Herramientas de IA", callback=self.toggle_ai
-        )
-        self.btn_generative = make_btn(
-            "\ue7b5", "Estilo IA", icon_font, self.toggle_generative
-        )
-        self.btn_eraser = make_btn(
-            "\ue81e", "Borrador Mágico", icon_font, self.toggle_magic_eraser
-        )
-        self.btn_undo = make_btn(
-            "\ue81c", "Deshacer Paso (Undo)", icon_font, self.undo_stack.undo
-        )
-        self.btn_redo = make_btn(
-            "\ue81d", "Rehacer Paso (Redo)", icon_font, self.undo_stack.redo
-        )
-        self.btn_cancel = make_btn(
-            "\ue711", "Cancelar Todo", icon_font, self.cancel_edits_prompt
-        )
-        self.btn_save = make_btn(
-            "\ue74e", "Guardar Imagen", icon_font, self.save_overwrite
-        )
-        self.btn_save.setVisible(False)
+        self.action_map = {}
+        self.edit_mode_actions = []
 
-        # Definir grupos lógicos una sola vez
-        self.toolbar_btns = [
-            self.btn_fullscreen,
-            self.btn_edit,
-            self.btn_mirror,
-            self.btn_rotate,
-            self.btn_crop,
-            self.btn_canvas,
-            self.btn_adjust,
-            self.btn_palette,
-            self.btn_ai,
-            self.btn_generative,
-            self.btn_eraser,
-            self.btn_undo,
-            self.btn_redo,
-            self.btn_cancel,
-            self.btn_save,
-        ]
-        self.edit_mode_btns = [
-            self.btn_mirror,
-            self.btn_rotate,
-            self.btn_crop,
-            self.btn_canvas,
-            self.btn_adjust,
-            self.btn_palette,
-            self.btn_ai,
-            self.btn_generative,
-            self.btn_eraser,
-            self.btn_save,
-            self.btn_redo,
+        # 1. Pantalla Completa
+        self.btn_fullscreen = TransparentToolButton(FluentIcon.FULL_SCREEN, self.toolbar_container)
+        self.btn_fullscreen.setToolTip("Pantalla Completa")
+        self.btn_fullscreen.clicked.connect(self.open_fullscreen)
+        self.toolbar_layout.addWidget(self.btn_fullscreen)
+        self.action_map["fullscreen"] = self.btn_fullscreen
+
+        # 2. Menú de Edición (Submenú nativo robusto con PushButton)
+        self.btn_edit = TransparentDropDownPushButton(FluentIcon.EDIT, "Editar Imagen", self.toolbar_container)
+        self.btn_edit.setCheckable(True)
+        
+        self.edit_menu = RoundMenu(parent=self.btn_edit)
+        self.edit_menu.setStyleSheet("""
+            RoundMenu, .RoundMenu {
+                background-color: #1e1e1e;
+                border: 1px solid #333333;
+                border-radius: 8px;
+            }
+            QMenuItem { color: #ccc; padding: 6px 12px; }
+            QMenuItem:selected { background-color: rgba(255, 255, 255, 0.1); color: white; }
+            QMenuItem:checked { background-color: rgba(0, 122, 204, 0.6); color: white; }
+            QMenuItem:checked:selected { background-color: rgba(0, 122, 204, 0.8); color: white; }
+        """)
+
+        EDIT_TOOLS_CONFIG = [
+            ("mirror",     FluentIcon.LAYOUT,      "Opciones de Espejo",self.toggle_mirror,    EditorState.EDIT_MIRROR),
+            ("rotate",     FluentIcon.SYNC,        "Opciones de Giro",  self.toggle_rotate,    EditorState.EDIT_ROTATE),
+            ("crop",       FluentIcon.CUT,         "Recortar Imagen",   self.toggle_crop,      EditorState.EDIT_CROP),
+            ("canvas",     FluentIcon.FIT_PAGE,    "Ampliar Lienzo",    self.toggle_canvas,    EditorState.EDIT_CANVAS),
+            ("adjust",     FluentIcon.BRIGHTNESS,  "Brillo y Contraste",self.toggle_adjust,    EditorState.EDIT_ADJUST),
+            ("palette",    FluentIcon.PALETTE,     "Extraer Paleta",    self.toggle_palette,   EditorState.EDIT_PALETTE),
+            ("quantize",   FluentIcon.PALETTE,     "Cuantizar Colores", self.toggle_quantize,  EditorState.EDIT_QUANTIZE),
+            ("ai",         FluentIcon.ROBOT,       "Herramientas de IA",self.toggle_ai,        EditorState.EDIT_AI),
+            ("generative", FluentIcon.PHOTO,       "Estilo IA",         self.toggle_generative,None),
+            ("eraser",     FluentIcon.ERASE_TOOL,  "Borrador Mágico",   self.toggle_magic_eraser, EditorState.EDIT_MAGIC_ERASER),
         ]
 
-        for b in self.toolbar_btns:
-            self.toolbar_layout.addWidget(b)
+        for action_id, icon, text, callback, state in EDIT_TOOLS_CONFIG:
+            action = Action(icon, text, self.edit_menu)
+            action.triggered.connect(callback)
+            action.setCheckable(True)
+            self.edit_menu.addAction(action)
+            self.action_map[action_id] = action
+            self.edit_mode_actions.append(action)
+
+        self.btn_edit.setMenu(self.edit_menu)
+        self.toolbar_layout.addWidget(self.btn_edit)
+        self.action_map["edit"] = self.btn_edit
+
+        # Hover Filter seguro
+        class MenuHoverFilter(QObject):
+            def __init__(self, btn):
+                super().__init__(btn)
+                self.btn = btn
+            def eventFilter(self, obj, event):
+                if obj == self.btn and event.type() == QEvent.Type.Enter:
+                    QTimer.singleShot(0, self.show_menu)
+                return super().eventFilter(obj, event)
+            def show_menu(self):
+                if self.btn.menu() and not self.btn.menu().isVisible():
+                    # Forzamos posición
+                    pos = self.btn.mapToGlobal(QPoint(0, self.btn.height() + 2))
+                    self.btn.menu().exec(pos)
+
+        self._btn_edit_hover_filter = MenuHoverFilter(self.btn_edit)
+        self.btn_edit.installEventFilter(self._btn_edit_hover_filter)
+
+        # Separador nativo
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setStyleSheet("border-left: 1px solid rgba(255, 255, 255, 0.2); margin: 5px 0px;")
+        self.toolbar_layout.addWidget(separator)
+
+        # 3. Deshacer / Rehacer / Cancelar
+        self.btn_undo = TransparentToolButton(FluentIcon.HISTORY, self.toolbar_container)
+        self.btn_undo.setToolTip("Deshacer (Undo)")
+        self.btn_undo.clicked.connect(self.undo_stack.undo)
+        self.toolbar_layout.addWidget(self.btn_undo)
+        self.action_map["undo"] = self.btn_undo
+
+        self.btn_redo = TransparentToolButton(FluentIcon.CHEVRON_RIGHT, self.toolbar_container)
+        self.btn_redo.setToolTip("Rehacer (Redo)")
+        self.btn_redo.clicked.connect(self.undo_stack.redo)
+        self.toolbar_layout.addWidget(self.btn_redo)
+        self.action_map["redo"] = self.btn_redo
+
+        self.btn_cancel = TransparentToolButton(FluentIcon.CANCEL, self.toolbar_container)
+        self.btn_cancel.setToolTip("Cancelar Todo")
+        self.btn_cancel.clicked.connect(self.cancel_edits_prompt)
+        self.toolbar_layout.addWidget(self.btn_cancel)
+        self.action_map["cancel"] = self.btn_cancel
+
         self.toolbar_layout.addStretch()
+
+        # Atajos de teclado
+        from PyQt6.QtGui import QKeySequence, QShortcut
+        QShortcut(QKeySequence.StandardKey.Undo, self).activated.connect(self.undo_stack.undo)
+        QShortcut(QKeySequence.StandardKey.Redo, self).activated.connect(self.undo_stack.redo)
+        QShortcut(QKeySequence("F11"), self).activated.connect(self.open_fullscreen)
+
+        from PyQt6.QtWidgets import QMenu
+        self.btn_save_main = QPushButton(" Guardar ")
+        self.btn_save_main.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.btn_save_main.setStyleSheet("""
+            QPushButton { background-color: #007acc; color: white; border-radius: 6px; padding: 6px 16px; }
+            QPushButton:hover:enabled { background-color: #0098ff; }
+            QPushButton:disabled { background-color: #1a1a1a; color: #555; }
+            QPushButton::menu-indicator { image: none; width: 0px; }
+        """)
+        self.save_menu = QMenu(self)
+        self.save_menu.setStyleSheet("QMenu { background-color: #2b2b2b; color: white; border: 1px solid #444; border-radius: 4px;} QMenu::item { padding: 8px 20px; } QMenu::item:selected { background-color: #007acc; }")
+        
+        act_overwrite = self.save_menu.addAction("💾 Sobrescribir Original")
+        act_overwrite.triggered.connect(self.save_overwrite)
+        
+        act_save_as = self.save_menu.addAction("📄 Guardar Copia Nueva...")
+        act_save_as.triggered.connect(self.save_as_copy)
+        
+        self.btn_save_main.setMenu(self.save_menu)
+        self.btn_save_main.setEnabled(False)
+        self.toolbar_layout.addWidget(self.btn_save_main)
+
         layout.addWidget(self.toolbar_container)
 
         # Adjust Panel
@@ -352,12 +555,12 @@ class ImageTab(QWidget):
         self.central_layout.setContentsMargins(0, 0, 0, 0)
         self.central_layout.setSpacing(0)
 
-        # Contenedor para el Visor y los elementos superpuestos (STACK)
+        # Crear contenedor STACK para visor
         self.viewer_stack = QWidget()
         self.stack_layout = QGridLayout(self.viewer_stack)
         self.stack_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 1. El Visor (al fondo)
+        # Montar visor al fondo
         self.viewer = ZoomableViewer()
         self.viewer.cancelClicked.connect(self._cancel_ai_worker)
         self.viewer.cropRequested.connect(self._on_crop_requested)
@@ -365,13 +568,13 @@ class ImageTab(QWidget):
         self.ai_worker = None
         self.stack_layout.addWidget(self.viewer, 0, 0)
 
-        # 2. El Panel de Botones Flotante (arriba a la izquierda)
+        # Montar panel flotante superior izquierdo
         self.side_palette_panel = PaletteToolsPanel(self)
 
         # --- NUEVO: 3. Panel Flotante para el Lienzo ---
         self.side_canvas_panel = CanvasToolsPanel(self)
 
-        # Layout superpuesto: Añadimos ambos paneles.
+        # Añadir paneles al layout superpuesto
         self.overlay_layout = QHBoxLayout()
         self.overlay_layout.setContentsMargins(15, 15, 0, 0)
         self.overlay_layout.addWidget(
@@ -415,9 +618,23 @@ class ImageTab(QWidget):
             "background-color: #d83b01; color: white; border-radius: 5px; padding: 8px 15px;"
         )
 
+        self.btn_ai_undo = QPushButton("↩️  Deshacer Clic")
+        self.btn_ai_undo.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.btn_ai_undo.setStyleSheet(
+            "background-color: #555555; color: white; border-radius: 5px; padding: 8px 15px;"
+        )
+        self.btn_ai_undo.setVisible(False)
+
+        self.quantize_widget = QuantizeControlsWidget(self)
+        self.quantize_widget.setVisible(False)
+        self.quantize_widget.slider.valueChanged.connect(self._on_quantize_colors_changed)
+
+        self.ai_confirm_layout.addWidget(self.quantize_widget)
+        self.ai_confirm_layout.addWidget(self.btn_ai_undo)
         self.ai_confirm_layout.addWidget(self.btn_ai_save)
         self.ai_confirm_layout.addWidget(self.btn_ai_discard)
 
+        self.btn_ai_undo.clicked.connect(self._undo_ai_click)
         self.btn_ai_save.clicked.connect(self._save_ai_result)
         self.btn_ai_discard.clicked.connect(self._discard_ai_result)
 
@@ -507,7 +724,7 @@ class ImageTab(QWidget):
             Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
         )
 
-        # Ensamblaje final
+        # Ensamblar UI
         self.central_layout.addWidget(self.viewer_stack, 1)
         self.central_layout.addWidget(self.adjust_panel)
 
@@ -525,7 +742,7 @@ class ImageTab(QWidget):
         )
         self.palette_bar.setVisible(False)
         palette_main_layout = QHBoxLayout(self.palette_bar)
-        # Contenedor de Paleta con SCROLL (Para no aplastar el botón de exportar)
+        # Añadir scroll a contenedor paleta
         self.palette_scroll = QScrollArea()
         self.palette_scroll.setWidgetResizable(True)
         self.palette_scroll.setFixedHeight(65)
@@ -539,6 +756,9 @@ class ImageTab(QWidget):
         self.palette_scroll.setWidget(self.palette_scroll_content)
 
         palette_main_layout.addWidget(self.palette_scroll, 1)
+        icon_font = QFont()
+        icon_font.setFamilies(["Segoe Fluent Icons", "Segoe MDL2 Assets"])
+        icon_font.setPointSize(14)
         self.btn_export_palette = make_btn(
             "\ue72d", "Exportar Paleta", icon_font, self.export_palette_image
         )
@@ -627,9 +847,8 @@ class ImageTab(QWidget):
 
         if state != EditorState.EDIT_PALETTE:
             self._clear_palette_markers()
-        for b in self.edit_mode_btns:
-            b.setStyleSheet(self.STYLE_DEFAULT)
-            b.setVisible(state != EditorState.MAIN)
+        for b in self.edit_mode_actions:
+            b.setChecked(False)
 
         is_crop = state == EditorState.EDIT_CROP
         self.viewer.set_crop_mode(is_crop)
@@ -647,33 +866,29 @@ class ImageTab(QWidget):
             self.eraser_panel.setVisible(is_eraser)
 
         if state == EditorState.MAIN:
-            self.btn_edit.setStyleSheet(self.STYLE_DEFAULT)
-            for b in [self.btn_undo, self.btn_redo, self.btn_cancel, self.btn_save]:
-                b.setVisible(False)
+            self.action_map["edit"].setChecked(False)
         else:
-            self.btn_edit.setStyleSheet(self.STYLE_ACTIVE)
-            for b in [self.btn_undo, self.btn_redo, self.btn_cancel, self.btn_save]:
-                b.setVisible(True)
+            self.action_map["edit"].setChecked(True)
             if state in [EditorState.EDIT_ADJUST, EditorState.EDIT_ROTATE]:
                 self._create_proxy_pixmap()
 
         active_map = {
             EditorState.EDIT_ADJUST: (
-                self.btn_adjust,
+                self.action_map["adjust"],
                 [self.br_container, self.ct_container],
             ),
-            EditorState.EDIT_ROTATE: (self.btn_rotate, [self.rt_container]),
-            EditorState.EDIT_CROP: (self.btn_crop, []),
-            EditorState.EDIT_PALETTE: (self.btn_palette, []),
-            EditorState.EDIT_MIRROR: (self.btn_mirror, []),
-            EditorState.EDIT_CANVAS: (self.btn_canvas, []),
-            EditorState.EDIT_AI: (self.btn_ai, []),
-            EditorState.EDIT_MAGIC_ERASER: (self.btn_eraser, []),
-            EditorState.EDIT_SAVE: (self.btn_save, []),
+            EditorState.EDIT_ROTATE: (self.action_map["rotate"], [self.rt_container]),
+            EditorState.EDIT_CROP: (self.action_map["crop"], []),
+            EditorState.EDIT_PALETTE: (self.action_map["palette"], []),
+            EditorState.EDIT_MIRROR: (self.action_map["mirror"], []),
+            EditorState.EDIT_CANVAS: (self.action_map["canvas"], []),
+            EditorState.EDIT_QUANTIZE: (self.action_map["quantize"], []),
+            EditorState.EDIT_AI: (self.action_map["ai"], []),
+            EditorState.EDIT_MAGIC_ERASER: (self.action_map["eraser"], []),
         }
         if state in active_map:
             btn, show_containers = active_map[state]
-            btn.setStyleSheet(self.STYLE_ACTIVE)
+            btn.setChecked(True)
             if state in [EditorState.EDIT_ADJUST, EditorState.EDIT_ROTATE]:
                 for c in (self.br_container, self.ct_container, self.rt_container):
                     c.setVisible(c in show_containers)
@@ -683,7 +898,7 @@ class ImageTab(QWidget):
 
     def _toggle_flyout_tool(self, state, tool_class, btn_widget, **tool_kwargs):
         if self.current_state == state:
-            self.set_state(EditorState.EDIT_ROOT)
+            return  # No hacer nada si ya está activo
         else:
             self.set_state(state)
             view = tool_class(**tool_kwargs)
@@ -699,32 +914,22 @@ class ImageTab(QWidget):
     def _on_flyout_closed(self, state):
         if self.active_flyout:
             self.active_flyout = None
-        # Excepción: Si cerramos el Flyout de la paleta, NO regresamos a EDIT_ROOT
-        # para que la barra inferior se mantenga visible y el mouse se libere.
+        # Mantener estado al cerrar flyout de paleta
+        # Preservar visibilidad y liberar ratón
         if self.current_state == state and state != EditorState.EDIT_PALETTE:
             self.set_state(EditorState.EDIT_ROOT)
 
     def _toggle_simple_state(self, state, on_exit=None):
         if self.current_state == state:
-            if on_exit:
-                on_exit()
-            self.set_state(EditorState.EDIT_ROOT)
+            return  # No hacer nada si ya está activo
         else:
             self.set_state(state)
-
-    # --- ACCIONES DE LA BARRA DE HERRAMIENTAS ---
-    def toggle_edit_mode(self):
-        self.set_state(
-            EditorState.EDIT_ROOT
-            if self.current_state == EditorState.MAIN
-            else EditorState.MAIN
-        )
 
     def toggle_mirror(self):
         self._toggle_flyout_tool(
             EditorState.EDIT_MIRROR,
             MirrorTool,
-            self.btn_mirror,
+            self.btn_edit,
             on_flip_h=self.toggle_flip_h,
             on_flip_v=self.toggle_flip_v,
         )
@@ -762,16 +967,68 @@ class ImageTab(QWidget):
     def toggle_magic_eraser(self):
         self._toggle_simple_state(EditorState.EDIT_MAGIC_ERASER)
 
-    def toggle_generative(self):
-        if self.current_state == EditorState.EDIT_AI:
-            self._toggle_simple_state(EditorState.MAIN)
+    def toggle_quantize(self):
+        if self.current_state == EditorState.EDIT_QUANTIZE:
+            self.set_state(EditorState.EDIT_ROOT)
         else:
-            self.set_state(EditorState.EDIT_AI)
-        
-        dialog = GenerativeDialog(self.original_pixmap, self)
-        dialog.generated.connect(self.on_generative_batch_finished)
-        dialog.exec()
-        self.set_state(EditorState.MAIN)
+            self.set_state(EditorState.EDIT_QUANTIZE)
+            self.current_ai_mode = "quantize"
+            self.ai_confirm_panel.setVisible(True)
+            self.btn_ai_undo.setVisible(False)
+            self.quantize_widget.setVisible(True)
+            self.quantize_widget.slider.blockSignals(True)
+            self.quantize_widget.spin.blockSignals(True)
+            self.quantize_widget.slider.setValue(8)
+            self.quantize_widget.spin.setValue(8)
+            self.quantize_widget.slider.blockSignals(False)
+            self.quantize_widget.spin.blockSignals(False)
+            self.quantize_widget.set_stats(0, 0, [])
+            self.quantize_widget.lbl_original_count.setText("Colores Origen: Calculando...")
+            self.original_color_count_cache = -1
+            self._on_quantize_colors_changed(8)
+
+    def _on_quantize_colors_changed(self, num_colors):
+        if self.original_pixmap.isNull():
+            return
+
+        if hasattr(self, "quant_worker") and self.quant_worker and self.quant_worker.isRunning():
+            self.quant_worker.terminate()
+            self.quant_worker.wait()
+
+        self.current_ai_mode = "quantize"
+        orig_qimg = self.original_pixmap.toImage()
+
+        count_orig = getattr(self, "original_color_count_cache", -1) == -1
+        self.quant_worker = QuantizationWorker(orig_qimg, num_colors=num_colors, count_original=count_orig)
+        self.quant_worker.finished.connect(self._on_quantize_finished)
+        self.quant_worker.start()
+
+    def _on_quantize_finished(self, result_qimg, original_count, hex_list):
+        if result_qimg.isNull() or self.original_pixmap.isNull():
+            return
+
+        self.ai_result_qimage = result_qimg
+
+        if original_count != -1:
+            self.original_color_count_cache = original_count
+
+        if hasattr(self, "quantize_widget") and self.quantize_widget.isVisible():
+            res_count = len(hex_list) if hex_list else self.quant_worker.num_colors
+            self.quantize_widget.set_stats(self.original_color_count_cache, res_count, hex_list)
+
+        orig_scaled = self.original_pixmap.scaled(
+            result_qimg.width(),
+            result_qimg.height(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.viewer.setComparisonMode(orig_scaled, QPixmap.fromImage(result_qimg))
+
+        self.btn_ai_save.setText("✅  Aplicar Cuantización")
+        self.btn_ai_undo.setVisible(False)
+        self.ai_confirm_panel.setVisible(True)
+        self.ai_overlay.show_review_mode()
+        self.viewer_v_container.raise_()
 
     def toggle_ai(self):
         self.set_state(EditorState.EDIT_AI)
@@ -804,6 +1061,7 @@ class ImageTab(QWidget):
             on_run_restore=self.run_ai_restore,
             on_run_depth=self.run_ai_depth,
             on_run_normal=self.run_ai_normal,
+            on_run_sam=self.run_ai_sam,
         )
         dialog = AIAdvancedDialog(actions, self)
         dialog.exec()
@@ -812,7 +1070,7 @@ class ImageTab(QWidget):
     def toggle_generative(self):
         self.set_state(EditorState.EDIT_AI)
 
-        # Extraer a numpy array para BLIP y Generative
+        # Extraer array NumPy para BLIP
         safe_qimage = self.original_pixmap.toImage().convertToFormat(
             QImage.Format.Format_RGB888
         )
@@ -839,7 +1097,7 @@ class ImageTab(QWidget):
             self.set_state(EditorState.EDIT_ROOT)
             return
 
-        # Anulamos el comando paramétrico pendiente de los spinboxes
+        # Anular comandos paramétricos pendientes
         self._current_cmd = None
 
         # --- FIX UNDO: Capturar estado SIN lienzo antes de hornearlo ---
@@ -849,7 +1107,7 @@ class ImageTab(QWidget):
         self.canvas_L, self.canvas_T, self.canvas_R, self.canvas_B = left_val, t, r, b
         # ----------------------------------------------------------------
 
-        # Hornear usando la pipeline a máxima resolución
+        # Hornear imagen por pipeline a máxima resolución
         old_state = self.current_state
         self.current_state = EditorState.MAIN
         self.update_image()
@@ -858,7 +1116,7 @@ class ImageTab(QWidget):
         self.current_state = old_state
         self._reset_transformation_params()
 
-        # Finalizar (Qt hace el push y refresca)
+        # Finalizar acción Qt
         self._end_edit()
         self.set_state(EditorState.EDIT_ROOT)
 
@@ -867,7 +1125,7 @@ class ImageTab(QWidget):
         self.canvas_L = self.canvas_T = self.canvas_R = self.canvas_B = 0
         self._sync_ui_to_state()
         self.update_image()
-        # Abortar comando de historial
+        # Abortar comando historial
         self._current_cmd = None
         self.set_state(EditorState.EDIT_ROOT)
 
@@ -931,26 +1189,26 @@ class ImageTab(QWidget):
     def _on_crop_requested(self, scene_rect):
         from PyQt6.QtCore import QRectF
 
-        # Mapeamos el rect de la escena (donde dibujó el usuario) al rect del pixmap transformado
+        # Mapear rect de escena a rect de pixmap
         intersect_f = self.viewer.pixmap_item.mapFromScene(
             QRectF(scene_rect)
         ).boundingRect()
 
-        # Intersectar con el contenido real para no intentar recortar fuera de los límites
+        # Intersectar coordenadas para no desbordar imagen
         intersect = intersect_f.intersected(QRectF(self.current_pixmap.rect()))
 
-        # Ignorar clics accidentales (rectángulos diminutos)
+        # Ignorar clics diminutos accidentales
         if intersect.width() < 10 or intersect.height() < 10:
             self.set_state(EditorState.EDIT_ROOT)
             return
 
         self._begin_edit("Recortar Imagen", is_destructive=True)
 
-        # Recortar de la imagen horneada
+        # Recortar imagen horneada
         cropped = self.current_pixmap.copy(intersect.toRect())
         self.original_pixmap = cropped
 
-        # Resetear todos los parámetros y renderizar la nueva imagen recortada como base
+        # Resetear parámetros y usar recorte como base
         self._reset_transformation_params()
         self.update_image()
 
@@ -974,34 +1232,34 @@ class ImageTab(QWidget):
         ptr.setsize(img.sizeInBytes())
         arr = np.array(np.frombuffer(ptr, np.uint8).reshape((img.height(), img.width(), 4)))
 
-        # OpenCV requiere memoria contigua y modificable
+        # Asegurar memoria contigua modificable para OpenCV
         bgr = arr[:, :, :3].copy()
 
-        # Obtener tolerancia y mapearla al rango de OpenCV (0-255)
+        # Mapear tolerancia a rango 0-255
         tol_val = self.slider_eraser_tol.value()
-        # Escalar un poco para dar más holgura: tol_val de 0-100 -> t de 0-100 es bastante.
+        # Añadir holgura escalada a tolerancia
         t = (tol_val, tol_val, tol_val)
 
-        # Máscara para cv2.floodFill debe ser +2 pixeles más grande que la imagen
+        # Ampliar máscara +2 píxeles para floodFill
         h, w = img.height(), img.width()
         mask = np.zeros((h + 2, w + 2), np.uint8)
 
-        # Usamos cv2.floodFill en modo FLOODFILL_MASK_ONLY para no dañar los colores reales
+        # Usar floodFill en FLOODFILL_MASK_ONLY para preservar color
         flags = 4 | (255 << 8) | cv2.FLOODFILL_MASK_ONLY
         cv2.floodFill(bgr, mask, (x, y), (0, 0, 0), t, t, flags)
 
-        # Extraer la máscara sin el borde de +2
+        # Recortar borde auxiliar de máscara
         arr_mask = mask[1:-1, 1:-1]
 
         # --- MEJORA INTELIGENTE (Anti-aliasing y Feathering) ---
-        # 1. Dilatar ligeramente la máscara para comerse el "halo" o "fleco" del color
+        # Dilatar máscara para eliminar halos
         kernel = np.ones((3, 3), np.uint8)
         arr_mask = cv2.dilate(arr_mask, kernel, iterations=1)
 
-        # 2. Desenfoque Gaussiano para suavizar los bordes (difuminado/feathering)
+        # Suavizar bordes con desenfoque Gaussiano
         arr_mask_blur = cv2.GaussianBlur(arr_mask, (5, 5), 0)
 
-        # 3. Aplicar transparencia suave multiplicando el canal Alfa original
+        # Aplicar transparencia con canal Alfa
         alpha_channel = arr[:, :, 3].astype(np.float32)
         multiplier = 1.0 - (arr_mask_blur.astype(np.float32) / 255.0)
         arr[:, :, 3] = (alpha_channel * multiplier).astype(np.uint8)
@@ -1009,7 +1267,7 @@ class ImageTab(QWidget):
 
         new_qimg = QImage(arr.data, w, h, w * 4, QImage.Format.Format_ARGB32).copy()
         self.original_pixmap = QPixmap.fromImage(new_qimg)
-        # No llamar a reset_transformation_params para no perder zoom
+        # Preservar zoom evitando resetear parámetros
         self.update_image()
 
         self._end_edit()
@@ -1030,9 +1288,16 @@ class ImageTab(QWidget):
     def run_ai_normal(self, model_rel_path):
         self._start_ai_worker("normal", "Estimando Mapa de Normales...", model_rel_path)
 
+    def run_ai_sam(self, model_rel_path):
+        self._start_ai_worker("sam_encode", "Preparando Extracción Interactiva...", model_rel_path)
+
     @log_action("Ejecutando Proceso de IA")
     def _start_ai_worker(self, mode, text, model_rel_path):
         if self.original_pixmap.isNull():
+            return
+            
+        if ImageTab.global_ai_lock:
+            QMessageBox.warning(self, "Aviso", "Ya hay un proceso de IA en ejecución. Espere o cancélelo primero.")
             return
 
         if excede_limite_megapixeles(self.original_pixmap, max_mp=4.0):
@@ -1046,21 +1311,21 @@ class ImageTab(QWidget):
             if res == QMessageBox.StandardButton.No:
                 return
 
+        ImageTab.global_ai_lock = True
         self.current_ai_mode = mode
-        self.viewer.show_ai_processing(True, text)
-        self._set_toolbar_enabled(False)
+        self.ai_overlay.show_processing(text)
 
         self.ai_thread = QThread()
 
-        # Convertir a QImage en el hilo principal de forma segura antes de pasar al worker
+        # Convertir QImage de forma asíncrona segura
         safe_qimage = self.original_pixmap.toImage()
         self.ai_worker = AIWorker(safe_qimage, mode, model_rel_path)
         self.ai_worker.moveToThread(self.ai_thread)
 
-        self.ai_worker.progress.connect(self.viewer.setProgress)
+        self.ai_worker.progress.connect(self.ai_overlay.setProgress)
         self.ai_thread.started.connect(self.ai_worker.run)
 
-        # Limpieza asíncrona impecable
+        # Limpiar asíncronamente recursos
         self.ai_worker.result_ready.connect(self.on_ai_finished)
         self.ai_worker.finished.connect(self.ai_thread.quit)
         self.ai_worker.finished.connect(self.ai_worker.deleteLater)
@@ -1082,15 +1347,20 @@ class ImageTab(QWidget):
         prompt,
         num_images=1,
         steps=30,
+        target_object=None,
     ):
         if self.original_pixmap.isNull():
             return
 
-        self.current_ai_mode = "generative"
-        self.viewer.show_ai_processing(True, "Inicializando motor Pytorch...")
-        self._set_toolbar_enabled(False)
+        if ImageTab.global_ai_lock:
+            QMessageBox.warning(self, "Aviso", "Ya hay un proceso de IA en ejecución. Espere o cancélelo primero.")
+            return
 
-        # Extraemos la imagen actual tal cual está en el visor (RGB)
+        ImageTab.global_ai_lock = True
+        self.current_ai_mode = "generative"
+        self.ai_overlay.show_processing("Inicializando motor Pytorch...")
+
+        # Extraer imagen del visor en formato RGB
         safe_qimage = self.original_pixmap.toImage().convertToFormat(
             QImage.Format.Format_RGB888
         )
@@ -1099,13 +1369,47 @@ class ImageTab(QWidget):
 
         ptr = safe_qimage.constBits()
         ptr.setsize(safe_qimage.sizeInBytes())
-        # QImage usa padding de 4 bytes por línea, así que usamos bytesPerLine
+        # Respetar padding de 4 bytes por línea en QImage
         arr = np.array(ptr).reshape(safe_qimage.height(), safe_qimage.bytesPerLine())
-        # Recortamos el padding y le damos forma (H, W, 3)
+        # Eliminar padding y formatear a (H, W, 3)
         img_np = arr[:, : safe_qimage.width() * 3].reshape(
             safe_qimage.height(), safe_qimage.width(), 3
         )
 
+        if gen_mode == "inpaint" and target_object:
+            from core.generative import AutoMaskingWorker
+            self.auto_mask_worker = AutoMaskingWorker(img_np, target_object)
+            self.auto_mask_worker.progress.connect(self.ai_overlay.title_label.setText)
+            self.auto_mask_worker.error.connect(self.on_ai_error)
+
+            def on_mask_ready(mask_pixmap):
+                # Convertir QPixmap a numpy array para pasárselo a GenerativeAIWorker
+                safe_mask = mask_pixmap.toImage().convertToFormat(QImage.Format.Format_Grayscale8)
+                ptr_mask = safe_mask.constBits()
+                ptr_mask.setsize(safe_mask.sizeInBytes())
+                # Asumimos que no hay padding si es de ancho correcto, pero es mejor usar shape completo
+                mask_np = np.array(ptr_mask).reshape(safe_mask.height(), safe_mask.bytesPerLine())
+                # Extraer máscara limpia
+                mask_np = mask_np[:, : safe_mask.width()]
+
+                self._start_actual_generative_worker(
+                    gen_mode, img_np, prompt, base_model_path, lora_path, 
+                    denoising_strength, num_images, steps, mask_np
+                )
+
+            self.auto_mask_worker.result_ready.connect(on_mask_ready)
+            self.auto_mask_worker.finished.connect(self.auto_mask_worker.deleteLater)
+            self.auto_mask_worker.start()
+        else:
+            self._start_actual_generative_worker(
+                gen_mode, img_np, prompt, base_model_path, lora_path, 
+                denoising_strength, num_images, steps, None
+            )
+
+    def _start_actual_generative_worker(
+        self, gen_mode, img_np, prompt, base_model_path, lora_path, 
+        denoising_strength, num_images, steps, mask_np
+    ):
         self.gen_worker = GenerativeAIWorker(
             mode=gen_mode,
             base_image=img_np,
@@ -1115,10 +1419,11 @@ class ImageTab(QWidget):
             denoising_strength=denoising_strength,
             num_images=num_images,
             num_inference_steps=steps,
+            mask_image=mask_np,
         )
 
-        self.gen_worker.progress.connect(self.viewer.setProgress)
-        self.gen_worker.status.connect(self.viewer.status_label.setText)
+        self.gen_worker.progress.connect(self.ai_overlay.setProgress)
+        self.gen_worker.status.connect(self.ai_overlay.title_label.setText)
 
         def finish_adapter(results_np_list):
             qimages = []
@@ -1201,16 +1506,48 @@ class ImageTab(QWidget):
             else:
                 QMessageBox.critical(self, "Error", "No se pudo guardar la imagen.")
 
-    def on_ai_finished(self, qimage):
+    def on_ai_finished(self, result):
+        import numpy as np
+        
         self.viewer.setProgress(100, 100)
         self._cleanup_ai()
 
+        if isinstance(result, np.ndarray) and getattr(self, "current_ai_mode", "") == "sam_encode":
+            from tools.sam_tool import SAMTool
+            self.sam_tool = SAMTool(self.viewer, result, self.original_pixmap)
+            self.viewer.scene.addItem(self.sam_tool)
+            self.viewer.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self._set_toolbar_enabled(True)
+            self.viewer.show_ai_processing(False)
+            
+            from qfluentwidgets import InfoBar, InfoBarPosition
+            InfoBar.info(
+                title="Puntero Mágico Listo",
+                content="Haz clic en la imagen (Izq: Agregar, Der: Quitar)",
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+                parent=self
+            )
+            
+            # Mostrar diálogo confirmación IA
+            is_inline_edit = getattr(self, "current_ai_mode", "") in ["rmbg", "sam_encode"]
+            if is_inline_edit:
+                self.btn_ai_save.setText("✅  Aplicar")
+            else:
+                self.btn_ai_save.setText("💾  Guardar Resultado")
+                
+            self.ai_confirm_panel.setVisible(True)
+            self.ai_overlay.show_review_mode()
+            self.viewer_v_container.raise_()
+            return
+
+        qimage = result
         self.ai_result_qimage = qimage
-        if getattr(self, "current_ai_mode", "") == "txt2img":
-            # No hay imagen base original para comparar, solo mostrar el resultado
-            self.viewer.setPixmap(QPixmap.fromImage(qimage))
-        else:
-            # Activar modo de comparación
+        is_inline_edit = getattr(self, "current_ai_mode", "") in ["rmbg", "sam_encode"]
+        
+        if is_inline_edit:
             orig_scaled = self.original_pixmap.scaled(
                 qimage.width(),
                 qimage.height(),
@@ -1218,75 +1555,163 @@ class ImageTab(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             )
             self.viewer.setComparisonMode(orig_scaled, QPixmap.fromImage(qimage))
+            self.btn_ai_save.setText("✅  Aplicar")
+            self.btn_ai_undo.setVisible(getattr(self, "current_ai_mode", "") == "sam_encode")
+            self.ai_confirm_panel.setVisible(True)
+            self.ai_overlay.show_review_mode()
+            self.viewer_v_container.raise_()
+        else:
+            main_win = self.window()
+            if hasattr(main_win, "open_ai_preview_tab"):
+                main_win.open_ai_preview_tab(
+                    qimage,
+                    self.original_pixmap,
+                    self.file_path,
+                    self.current_ai_mode
+                )
 
+    def set_ai_preview_mode(self, result_qimage, original_pixmap, source_file_path, ai_mode):
+        self.ai_result_qimage = result_qimage
+        self.current_ai_mode = ai_mode
+        self.ai_preview_source_path = source_file_path
+        
+        if ai_mode == "txt2img" or original_pixmap.isNull():
+            self.viewer.setPixmap(QPixmap.fromImage(result_qimage))
+        else:
+            orig_scaled = original_pixmap.scaled(
+                result_qimage.width(),
+                result_qimage.height(),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.viewer.setComparisonMode(orig_scaled, QPixmap.fromImage(result_qimage))
+            
+        self.btn_ai_save.setText("💾  Guardar Resultado")
+        self.btn_ai_undo.setVisible(False)
         self.ai_confirm_panel.setVisible(True)
-        self._set_toolbar_enabled(
-            False
-        )  # Mantener bloqueado hasta confirmar o descartar
+        self.ai_overlay.show_review_mode()
+        self.viewer_v_container.raise_()
+        # Validar modo edición activo
+        self.set_state(EditorState.EDIT_ROOT)
+
+    def _undo_ai_click(self):
+        if hasattr(self, "sam_tool") and self.sam_tool:
+            self.sam_tool.undo_point()
 
     def _save_ai_result(self):
+        is_inline_edit = False
+        if hasattr(self, "sam_tool") and self.sam_tool:
+            self.ai_result_qimage = self.sam_tool.get_result().toImage()
+            self.viewer.scene.removeItem(self.sam_tool)
+            self.sam_tool = None
+            is_inline_edit = True
+            
         if not hasattr(self, "ai_result_qimage"):
             return
 
-        base, ext = os.path.splitext(self.file_path)
-        mode_suffix = getattr(self, "current_ai_mode", "ai")
-        default_path = f"{base}_{mode_suffix}.png"
+        if getattr(self, "current_ai_mode", "") in ["rmbg", "sam_encode", "quantize"]:
+            is_inline_edit = True
 
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Guardar Resultado de IA",
-            default_path,
-            "PNG (*.png);;JPEG (*.jpg);;WEBP (*.webp)",
-        )
-        if not file_path:
-            return  # Canceló el diálogo
+        temp_to_delete = None
+        if not is_inline_edit:
+            if hasattr(self, "ai_preview_source_path") and self.ai_preview_source_path:
+                base, ext = os.path.splitext(self.ai_preview_source_path)
+                temp_to_delete = self.file_path  # Es el scratch/ai_preview_xxx.png
+            else:
+                base, ext = os.path.splitext(self.file_path)
+                
+            mode_suffix = getattr(self, "current_ai_mode", "ai")
+            default_path = f"{base}_{mode_suffix}.png"
 
-        if self.ai_result_qimage.save(file_path):
-            logger.info(
-                f"IA: Variante guardada con éxito -> {os.path.basename(file_path)}"
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Guardar Resultado de IA",
+                default_path,
+                "PNG (*.png);;JPEG (*.jpg);;WEBP (*.webp)",
             )
+            if not file_path:
+                return  # Canceló el diálogo
 
-            # Cargar como imagen principal y restaurar UI
+            if not self.ai_result_qimage.save(file_path):
+                QMessageBox.critical(
+                    self,
+                    "Error al guardar",
+                    "No se pudo guardar la variante de IA en el disco.",
+                )
+                return
+            
+            logger.info(f"IA: Variante guardada con éxito -> {os.path.basename(file_path)}")
+            self.file_path = file_path
+            self.ai_preview_source_path = None
+
+        # Restaurar UI con nueva imagen principal
+        if is_inline_edit:
             self._begin_edit("Aplicar Resultado IA", is_destructive=True)
             self.original_pixmap = QPixmap.fromImage(self.ai_result_qimage)
-            self.file_path = file_path
             self._reset_transformation_params()
             self._end_edit()
+        else:
+            self.original_pixmap = QPixmap.fromImage(self.ai_result_qimage)
+            self._reset_transformation_params()
+            self.undo_stack.clear()
 
-            self._discard_ai_result()  # Restaura la UI
-            self.update_image()
-            self.imageUpdated.emit()
+        self._discard_ai_result(is_saving=True)  # Restaura la UI
+        self.update_image()
+        self.imageUpdated.emit()
 
-            # Actualizar título de la pestaña
+        if not is_inline_edit:
+            # Actualizar título pestaña
             main_win = self.window()
             if hasattr(main_win, "tabs"):
                 idx = main_win.tabs.indexOf(self)
                 if idx != -1:
-                    main_win.tabs.setTabText(idx, os.path.basename(file_path))
-        else:
-            QMessageBox.critical(
-                self,
-                "Error al guardar",
-                "No se pudo guardar la variante de IA en el disco.",
-            )
+                    main_win.tabs.setTabText(idx, os.path.basename(self.file_path))
+                    
+            if temp_to_delete and os.path.exists(temp_to_delete):
+                try:
+                    os.remove(temp_to_delete)
+                except Exception:
+                    pass
 
-    def _discard_ai_result(self):
+    def _discard_ai_result(self, is_saving=False):
+        if hasattr(self, "ai_preview_source_path") and self.ai_preview_source_path and not is_saving:
+            main_win = self.window()
+            if hasattr(main_win, "tabs"):
+                idx = main_win.tabs.indexOf(self)
+                if idx != -1:
+                    main_win.close_tab(idx)
+            
+            if os.path.exists(self.file_path):
+                try:
+                    os.remove(self.file_path)
+                except Exception:
+                    pass
+            return
+            
+        if hasattr(self, "sam_tool") and self.sam_tool:
+            self.viewer.scene.removeItem(self.sam_tool)
+            self.sam_tool = None
+            self.viewer.show_ai_processing(False)
+            
         self.ai_confirm_panel.setVisible(False)
+        if hasattr(self, "quantize_widget"):
+            self.quantize_widget.setVisible(False)
+        self.ai_overlay.hide_processing()
         self.viewer.setPixmap(self.original_pixmap)
         self._set_toolbar_enabled(True)
 
     def on_ai_error(self, message):
         """Maneja errores de IA y muestra mensajes claros al usuario."""
-        # Detectar si es limitación de hardware o error técnico
+        # Diferenciar entre falta hardware o error técnico
         is_hardware_issue = "LIMITACIÓN DE HARDWARE" in message or "VRAM" in message
 
         if is_hardware_issue:
-            # Diálogo de advertencia (hardware insuficiente)
+            # Lanzar advertencia hardware
             QMessageBox.warning(
                 self, "⚠️ Hardware Insuficiente", message, QMessageBox.StandardButton.Ok
             )
         else:
-            # Diálogo de error (problema técnico)
+            # Lanzar error técnico
             QMessageBox.critical(
                 self,
                 "❌ Error en Procesamiento de IA",
@@ -1297,24 +1722,24 @@ class ImageTab(QWidget):
         self._cleanup_ai()
 
     def _cleanup_ai(self):
-        self.viewer.show_ai_processing(False)
-        self._set_toolbar_enabled(True)
-        # Mantenemos las referencias vivas en Python.
-        # C++ las destruirá de forma segura en el bucle de eventos (deleteLater).
-        # Se sobrescribirán solas la próxima vez que se ejecute la IA.
+        ImageTab.global_ai_lock = False
+        self.ai_overlay.hide_processing()
+        # Preservar referencias vivas en scope Python
+        # Delegar destrucción a bucle de eventos (deleteLater)
+        # Permitir sobrescritura en siguiente iteración IA
 
     def _set_toolbar_enabled(self, enabled):
         """Bloquea o desbloquea toda la barra de herramientas superior."""
         tools = [
-            self.btn_fullscreen,
-            self.btn_edit,
-            self.btn_mirror,
-            self.btn_rotate,
-            self.btn_canvas,
-            self.btn_adjust,
-            self.btn_palette,
-            self.btn_ai,
-            self.btn_generative,
+            self.action_map["fullscreen"],
+            self.action_map["edit"],
+            self.action_map["mirror"],
+            self.action_map["rotate"],
+            self.action_map["canvas"],
+            self.action_map["adjust"],
+            self.action_map["palette"],
+            self.action_map["ai"],
+            self.action_map["generative"],
         ]
         for b in tools:
             b.setEnabled(enabled)
@@ -1322,7 +1747,7 @@ class ImageTab(QWidget):
         if enabled:
             self.update_menu_state()
         else:
-            for b in [self.btn_undo, self.btn_redo, self.btn_cancel, self.btn_save]:
+            for b in [self.action_map["undo"], self.action_map["redo"], self.action_map["cancel"], self.btn_save_main]:
                 b.setEnabled(False)
 
     def _clear_palette_markers(self):
@@ -1353,12 +1778,12 @@ class ImageTab(QWidget):
         if not final_data:
             return
         w, h = self.current_pixmap.width(), self.current_pixmap.height()
-        # El círculo medirá aproximadamente el 2.5% del lado más corto
+        # Escalar marcador circular al 2.5%
         marker_size = max(20, min(w, h) // 40)
 
         for item in final_data:
             c = item["color"]
-            # Colocar el marcador en la coordenada real de muestreo
+            # Situar marcador en coordenadas reales
             marker = ColorMarker(c, item["x"], item["y"], size=marker_size)
             self.viewer.scene.addItem(marker)
             self.palette_markers.append(marker)
@@ -1460,15 +1885,16 @@ class ImageTab(QWidget):
         has_history = self.undo_stack.count() > 0 or is_dirty
 
         if self.current_state != EditorState.MAIN:
-            self.btn_undo.setEnabled(self.undo_stack.canUndo())
-            self.btn_redo.setEnabled(self.undo_stack.canRedo())
-            self.btn_cancel.setEnabled(has_history)
-            self.btn_save.setEnabled(has_history)
+            self.action_map["undo"].setEnabled(self.undo_stack.canUndo())
+            self.action_map["redo"].setEnabled(self.undo_stack.canRedo())
+            self.action_map["cancel"].setEnabled(has_history)
+            
+        self.btn_save_main.setEnabled(has_history)
 
     # --- MOTOR DE RENDERIZADO (OPEN CV + NUMPY) ---
     def _sync_ui_to_state(self):
         """Sincroniza todos los sliders y spinboxes con las variables internas."""
-        # 1. Sliders (Brillo, Contraste, Rotación)
+        # Actualizar sliders transformaciones
         for s, v in [
             (self.slider_brightness, int(self.brightness * 100)),
             (self.slider_contrast, int(self.contrast * 100)),
@@ -1478,12 +1904,12 @@ class ImageTab(QWidget):
             s.setValue(v)
             s.blockSignals(False)
 
-        # 2. Spinboxes de Lienzo
+        # Actualizar spinboxes lienzo
         self._sync_canvas_spinboxes()
 
-        # 3. Color de fondo del lienzo
+        # Actualizar fondo lienzo
         if hasattr(self, "canvas_color_indicator"):
-            # Convertimos a QColor para asegurar que .name() sea el método de Qt y no la propiedad del Enum
+            # Castear a QColor para asegurar método .name()
             c = QColor(self.canvas_bg_color)
             self.canvas_color_indicator.setStyleSheet(
                 f"background-color: {c.name()}; border: 1px solid #aaa; border-radius: 2px;"
@@ -1499,9 +1925,10 @@ class ImageTab(QWidget):
 
     def cancel_edits(self):
         self._reset_transformation_params()
-        self.original_pixmap = QPixmap(self.file_path)
+        self.original_pixmap = load_pixmap_safely(self.file_path)
         self.undo_stack.clear()
         self.update_image()
+        self.ai_overlay.hide_processing()
         self.update_menu_state()
         self.set_state(EditorState.MAIN)
 
@@ -1526,7 +1953,7 @@ class ImageTab(QWidget):
         self.update_image()
 
     def choose_custom_color(self):
-        # Usamos un timer para evitar el crash de animaciones al cerrar el Flyout
+        # Implementar timer para prevenir crashes de animación
         QTimer.singleShot(10, self._open_color_dialog)
 
     def _open_color_dialog(self):
@@ -1547,11 +1974,11 @@ class ImageTab(QWidget):
 
     @log_action("Renderizando Transformaciones finales")
     def _apply_transform_to_file(self):
-        # Renderiza el contenido a máxima resolución usando la nueva función pura
+        # Renderizar contenido a resolución nativa
         old_state = self.current_state
         self.current_state = EditorState.MAIN
 
-        # Invocas a tu core de procesamiento pasándole la imagen original a tope de resolución
+        # Invocar procesamiento sobre imagen original pura
         final_pix, _ = apply_image_transformations(
             self.original_pixmap,
             self.brightness,
@@ -1645,7 +2072,7 @@ class ImageTab(QWidget):
         self.update_menu_state()
 
     def _on_adjust_changed(self):
-        # Convertimos 0..200 a factor 0.0..2.0
+        # Mapear rango numérico a factor flotante
         self.brightness = self.slider_brightness.value() / 100.0
         self.contrast = self.slider_contrast.value() / 100.0
         self.angle = self.slider_rotate.value()
@@ -1664,3 +2091,44 @@ class ImageTab(QWidget):
             )
         else:
             self.proxy_pixmap = self.original_pixmap.copy()
+
+    def keyPressEvent(self, event):
+        """Captura atajos de teclado globales para la pestaña."""
+        modifiers = event.modifiers()
+        
+        # Deshacer / Rehacer
+        if modifiers == Qt.KeyboardModifier.ControlModifier:
+            if event.key() == Qt.Key.Key_Z:
+                self.undo_stack.undo()
+                event.accept()
+                return
+            elif event.key() == Qt.Key.Key_Y:
+                self.undo_stack.redo()
+                event.accept()
+                return
+                
+        # Navegar imágenes galería
+        if event.key() == Qt.Key.Key_Left:
+            self.cancel_edits()
+            self.navigateRequested.emit("prev")
+            event.accept()
+            return
+        elif event.key() == Qt.Key.Key_Right:
+            self.cancel_edits()
+            self.navigateRequested.emit("next")
+            event.accept()
+            return
+            
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        if hasattr(self, 'ai_overlay'):
+            self.ai_overlay.resize(self.size())
+            # Ensure it stays on top if it's visible
+            if self.ai_overlay.isVisible():
+                self.ai_overlay.raise_()
+                # Si estamos en modo revisión, levantar el contenedor del visor
+                if hasattr(self, 'ai_confirm_panel') and self.ai_confirm_panel.isVisible():
+                    if hasattr(self, 'viewer_v_container'):
+                        self.viewer_v_container.raise_()
+        super().resizeEvent(event)

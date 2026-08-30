@@ -77,9 +77,10 @@ class GenerativeAIWorker(BaseMLWorker):
         denoising_strength=0.5,
         num_images=1,
         num_inference_steps=30,
+        mask_image=None,
     ):
         super().__init__()
-        self.mode = mode  # "img2img" o "txt2img"
+        self.mode = mode  # "img2img" o "txt2img" o "inpaint"
         self.base_image = base_image  # numpy array (RGB)
         self.prompt = prompt
         self.base_model_path = base_model_path
@@ -87,10 +88,11 @@ class GenerativeAIWorker(BaseMLWorker):
         self.denoising_strength = denoising_strength
         self.num_images = num_images
         self.num_inference_steps = num_inference_steps
+        self.mask_image = mask_image
 
     def execute_task(self):
         import torch
-        from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline
+        from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline, StableDiffusionInpaintPipeline
 
         pipeline = None
 
@@ -115,14 +117,14 @@ class GenerativeAIWorker(BaseMLWorker):
                 pass
             # -------------------------------------------------------------------
 
-            # 1. Preparar imagen (Solo para img2img)
+            # Preparar imagen para img2img
             init_image = None
             if self.mode == "img2img" and self.base_image is not None:
                 self.progress.emit(10, 100)
                 self.status.emit("Preparando imagen base...")
                 init_image = Image.fromarray(self.base_image).convert("RGB")
 
-                # Redimensionar optimizando el ÁREA TOTAL (512x512 = 262144 píxeles)
+                # Ejecutar redimensionamiento optimizando área total (Max 262144 píxeles)
                 max_area = 512 * 512
                 w, h = init_image.size
                 current_area = w * h
@@ -134,12 +136,39 @@ class GenerativeAIWorker(BaseMLWorker):
                 else:
                     new_w, new_h = w, h
 
-                # SD requiere que las dimensiones sean múltiplos de 8
+                # Asegurar dimensiones múltiplo de 8 para SD
                 new_w_8 = int(round(new_w / 8.0)) * 8
                 new_h_8 = int(round(new_h / 8.0)) * 8
 
                 if new_w_8 != w or new_h_8 != h:
                     init_image = init_image.resize((new_w_8, new_h_8), Image.LANCZOS)
+                    
+            mask_pil = None
+            if self.mode == "inpaint" and self.mask_image is not None:
+                self.progress.emit(10, 100)
+                self.status.emit("Preparando máscara de Inpainting...")
+                
+                # init_image ya se preparó si base_image fue provista
+                if init_image is None and self.base_image is not None:
+                    init_image = Image.fromarray(self.base_image).convert("RGB")
+                    # Escalar al igual que img2img
+                    max_area = 512 * 512
+                    w, h = init_image.size
+                    current_area = w * h
+                    if current_area > max_area:
+                        scale = math.sqrt(max_area / current_area)
+                        new_w = w * scale
+                        new_h = h * scale
+                    else:
+                        new_w, new_h = w, h
+                    new_w_8 = int(round(new_w / 8.0)) * 8
+                    new_h_8 = int(round(new_h / 8.0)) * 8
+                    if new_w_8 != w or new_h_8 != h:
+                        init_image = init_image.resize((new_w_8, new_h_8), Image.LANCZOS)
+                        
+                mask_pil = Image.fromarray(self.mask_image).convert("L")
+                if init_image:
+                    mask_pil = mask_pil.resize(init_image.size, Image.NEAREST)
 
             if self._is_cancelled:
                 return
@@ -148,14 +177,15 @@ class GenerativeAIWorker(BaseMLWorker):
             self.progress.emit(20, 100)
             self.status.emit("Cargando modelo base...")
 
-            # Usar float32 para evitar el bug de imágenes negras (NaNs en VRAM) en tarjetas GTX 16xx.
+            # Forzar float32 para prevenir imágenes negras (NaNs) en GTX 16xx
             model_dtype = torch.float32
 
-            pipeline_class = (
-                StableDiffusionImg2ImgPipeline
-                if self.mode == "img2img"
-                else StableDiffusionPipeline
-            )
+            if self.mode == "inpaint":
+                pipeline_class = StableDiffusionInpaintPipeline
+            elif self.mode == "img2img":
+                pipeline_class = StableDiffusionImg2ImgPipeline
+            else:
+                pipeline_class = StableDiffusionPipeline
 
             if os.path.isfile(self.base_model_path):
                 pipeline = pipeline_class.from_single_file(
@@ -178,18 +208,13 @@ class GenerativeAIWorker(BaseMLWorker):
                     low_cpu_mem_usage=False,
                 )
 
-            # Optimización de cálculo para contener el consumo de VRAM
+            # Optimizar cálculos para reducir consumo VRAM
             pipeline.enable_attention_slicing()
 
-            # Usar xformers si está disponible (vital para evitar NaNs en GTX 1650/1660 en float16)
-            try:
-                import xformers  # noqa: F401
+            # PyTorch 2.0 usa Scaled Dot-Product Attention de forma nativa.
+            # No forzamos xformers porque en GPUs viejas (ej. Compute 7.5) causa crash si no está compilado a medida.
 
-                pipeline.enable_xformers_memory_efficient_attention()
-            except ImportError:
-                pass
-
-            # 3. Cargar LoRA si existe (¡DEBE HACERSE ANTES DEL CPU OFFLOAD!)
+            # Cargar LoRA previo a CPU OFFLOAD
             if self.lora_path and os.path.isfile(self.lora_path):
                 self.progress.emit(40, 100)
                 self.status.emit(
@@ -201,7 +226,7 @@ class GenerativeAIWorker(BaseMLWorker):
                     weight_name=os.path.basename(self.lora_path),
                 )
 
-                # Forzar que los módulos del LoRA inyectados adopten el dtype correcto
+                # Forzar dtype correcto en módulos LoRA inyectados
                 pipeline.unet.to(dtype=model_dtype)
                 if (
                     hasattr(pipeline, "text_encoder")
@@ -209,16 +234,16 @@ class GenerativeAIWorker(BaseMLWorker):
                 ):
                     pipeline.text_encoder.to(dtype=model_dtype)
 
-            # Descarga automática secuencial de componentes (Crucial para tarjetas de 4GB)
+            # Descargar componentes secuencialmente (vital para 4GB VRAM)
             pipeline.enable_model_cpu_offload()
 
             if self._is_cancelled:
                 return
 
-            # 4. Generar
+            # Generar inferencia
             self.progress.emit(50, 100)
 
-            # El Negative Prompt es OBLIGATORIO en modelos de Anime/Arte para evitar resultados horrendos
+            # Forzar Negative Prompt en modelos anime/arte
             negative_prompt = "(worst quality, low quality, normal quality:1.4), bad anatomy, bad hands, missing fingers, extra digit, blurry, ugly, watermark, signature, artifacts, deformed, noise, ugly face"
 
             results_np = []
@@ -227,7 +252,7 @@ class GenerativeAIWorker(BaseMLWorker):
                     return
                 self.status.emit(f"Generando variación {i + 1} de {self.num_images}...")
 
-                # Semilla única para cada iteración para asegurar variaciones
+                # Inyectar semilla única por iteración
                 seed = torch.randint(0, 1000000, (1,)).item()
                 generator = torch.Generator(device="cpu").manual_seed(seed)
 
@@ -238,7 +263,7 @@ class GenerativeAIWorker(BaseMLWorker):
                     else max(1, int(base_steps * self.denoising_strength))
                 )
 
-                # Parámetros comunes
+                # Configurar parámetros comunes
                 def step_callback(step_idx: int, timestep, latents):
                     if self._is_cancelled:
                         raise InterruptedError("Generación cancelada por el usuario")
@@ -256,8 +281,13 @@ class GenerativeAIWorker(BaseMLWorker):
                     "callback_steps": 1,
                 }
 
-                # Inyección condicional
-                if self.mode == "img2img" and init_image is not None:
+                if self.mode == "inpaint" and init_image is not None and mask_pil is not None:
+                    gen_kwargs["image"] = init_image
+                    gen_kwargs["mask_image"] = mask_pil
+                    gen_kwargs["strength"] = self.denoising_strength
+                    gen_kwargs["width"] = init_image.width
+                    gen_kwargs["height"] = init_image.height
+                elif self.mode == "img2img" and init_image is not None:
                     gen_kwargs["image"] = init_image
                     gen_kwargs["strength"] = self.denoising_strength
                 else:
@@ -270,7 +300,7 @@ class GenerativeAIWorker(BaseMLWorker):
                 except InterruptedError:
                     return
 
-                # Progreso proporcional
+                # Calcular progreso proporcional
                 prog = 50 + int(40 * (i + 1) / self.num_images)
                 self.progress.emit(prog, 100)
 
@@ -314,7 +344,7 @@ class CaptioningWorker(BaseMLWorker):
 
             image = Image.fromarray(self.base_image_np)
 
-            # Moondream no necesita reducir tanto la imagen como BLIP, pero lo hacemos por seguridad de RAM
+            # Reducir imagen preventivamente para Moondream
             max_dim = 768
             w, h = image.size
             if max(w, h) > max_dim:
@@ -339,7 +369,7 @@ class CaptioningWorker(BaseMLWorker):
 
             self.progress.emit("Analizando composición y estilo...")
 
-            prompt = "Describe this image in detail. Specifically mention its art style (e.g., anime, realistic photography, oil painting, 3d render, cartoon), its composition, and its main subject or actions."
+            prompt = "Provide maximum 15 comma-separated keywords describing this image. Focus purely on art style, main subject, and key visual elements. Do not use full sentences."
 
             enc_image = model.encode_image(image)
 
@@ -405,3 +435,134 @@ class PromptEnhancerWorker(BaseMLWorker):
             self._cleanup_vram(enhancer)
 
         self.result_ready.emit(enhanced_text)
+
+class AutoMaskingWorker(BaseMLWorker):
+    progress = pyqtSignal(str)
+    result_ready = pyqtSignal(object)  # Returns QPixmap mask
+
+    def __init__(self, base_image_np, target_object):
+        super().__init__()
+        self.base_image_np = base_image_np
+        self.target_object = target_object
+        self.MODEL_ID = "google/owlvit-base-patch32"
+
+    def execute_task(self):
+        import torch
+        import cv2
+        import numpy as np
+        from PyQt6.QtGui import QImage, QPixmap
+        from transformers import pipeline
+        from core.threads import _load_model
+        from tools.sam_tool import _load_sam_decoder
+        from tools.ai_tool import get_base_path
+        import os
+
+        # 1. Ejecutar OwlViT para detectar la caja delimitadora (Bounding Box)
+        self.progress.emit(f"Buscando '{self.target_object}' en la imagen...")
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        detector = pipeline(model=self.MODEL_ID, task="zero-shot-object-detection", device=device)
+        
+        image = Image.fromarray(self.base_image_np).convert("RGB")
+        
+        # TRUCO: Expandir automáticamente el prompt para burlar el sesgo fotográfico
+        search_terms = [
+            self.target_object, 
+            f"anime {self.target_object}", 
+            f"illustration of {self.target_object}",
+            f"2d character {self.target_object}"
+        ]
+        
+        # Reducimos el umbral al 2% (0.02). Como buscamos el 'max' luego, 
+        # no importa si detecta basura, nos quedaremos con el que tenga mayor puntaje real.
+        preds = detector(image, candidate_labels=search_terms, threshold=0.02)
+        
+        del detector
+        self._cleanup_vram()
+
+        if self._is_cancelled:
+            return
+
+        if not preds:
+            raise ValueError(f"No se pudo encontrar '{self.target_object}' en la imagen.")
+            
+        # Tomar la predicción con mayor confianza
+        best_pred = max(preds, key=lambda x: x["score"])
+        box = best_pred["box"]
+        xmin, ymin, xmax, ymax = box["xmin"], box["ymin"], box["xmax"], box["ymax"]
+
+        # 2. Cargar MobileSAM para generar la máscara
+        self.progress.emit("Generando máscara semántica perfecta (SAM)...")
+        
+        base_path = get_base_path()
+        enc_path = os.path.normpath(os.path.join(base_path, "models/sam/mobilesam.encoder.onnx"))
+        
+        if not os.path.exists(enc_path):
+            self.progress.emit("Descargando MobileSAM (única vez, ~40MB)...")
+            from huggingface_hub import hf_hub_download
+            import shutil
+            os.makedirs(os.path.dirname(enc_path), exist_ok=True)
+            
+            enc_cache = hf_hub_download(repo_id="PulpCut/mobilesam-onnx", filename="mobilesam.encoder.onnx")
+            shutil.copy2(enc_cache, enc_path)
+            
+            dec_cache = hf_hub_download(repo_id="PulpCut/mobilesam-onnx", filename="mobilesam.decoder.onnx")
+            dec_path = os.path.join(os.path.dirname(enc_path), "mobilesam.decoder.onnx")
+            shutil.copy2(dec_cache, dec_path)
+            
+        # Ejecutar Encoder (redimensionar a 1024x1024)
+        session_enc = _load_model(enc_path)
+        img_resized = cv2.resize(self.base_image_np, (1024, 1024), interpolation=cv2.INTER_CUBIC)
+        img_input = img_resized.astype(np.float32)
+        
+        out_enc = session_enc.run(None, {"input_image": img_input})
+        embedding = out_enc[0]
+        
+        if self._is_cancelled:
+            return
+            
+        # Ejecutar Decoder
+        session_dec = _load_sam_decoder()
+        
+        # Escalar coordenadas de la caja a 1024x1024
+        orig_w, orig_h = image.size
+        scale_x = 1024.0 / orig_w
+        scale_y = 1024.0 / orig_h
+        
+        pts = np.array([[xmin * scale_x, ymin * scale_y], [xmax * scale_x, ymax * scale_y]], dtype=np.float32)
+        lbls = np.array([2, 3], dtype=np.float32) # 2 y 3 representan TopLeft y BottomRight de una caja
+        
+        point_coords = pts.reshape(1, 2, 2)
+        point_labels = lbls.reshape(1, 2)
+        mask_input = np.zeros((1, 1, 256, 256), dtype=np.float32)
+        has_mask_input = np.zeros((1,), dtype=np.float32)
+        orig_im_size = np.array([float(1024), float(1024)], dtype=np.float32)
+        
+        out_dec = session_dec.run(None, {
+            "image_embeddings": embedding,
+            "point_coords": point_coords,
+            "point_labels": point_labels,
+            "mask_input": mask_input,
+            "has_mask_input": has_mask_input,
+            "orig_im_size": orig_im_size
+        })
+        
+        mask = out_dec[0][0, 0, :, :]
+        
+        # Redimensionar máscara al original
+        mask_cv = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        mask_cv = (mask_cv > 0.0).astype(np.uint8) * 255 # Binarizar
+        
+        # Convertir a QPixmap (Blanco y Negro)
+        # Blanco = Máscara, Negro = Fondo
+        color_mask = np.zeros((orig_h, orig_w, 4), dtype=np.uint8)
+        color_mask[:, :, 0] = mask_cv # R
+        color_mask[:, :, 1] = mask_cv # G
+        color_mask[:, :, 2] = mask_cv # B
+        color_mask[:, :, 3] = 255     # Alpha sólido
+        
+        bytes_per_line = 4 * orig_w
+        qimg = QImage(color_mask.data, orig_w, orig_h, bytes_per_line, QImage.Format.Format_RGBA8888).copy()
+        mask_pixmap = QPixmap.fromImage(qimg)
+        
+        self.result_ready.emit(mask_pixmap)

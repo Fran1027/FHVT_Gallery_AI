@@ -31,16 +31,16 @@ def ensure_optimal_onnx_runtime():
     Gestor inteligente del entorno de ONNX.
     Detecta el hardware y resuelve conflictos entre onnxruntime (CPU) y versiones de GPU.
     """
-    # 1. Si la aplicación está compilada (.exe), no tocamos pip.
+    # Ignorar pip en versión compilada (.exe)
     if getattr(sys, 'frozen', False):
         return
 
-    # 2. Analizar el hardware
+    # Analizar hardware
     # check_cuda_support() devuelve True si hay NVIDIA pero NO hay CUDA toolkit.
     # Si devuelve False, puede ser: NVIDIA+CUDA, AMD, o Intel.
     has_nvidia_no_cuda = check_cuda_support()
     
-    # Vamos a ser un poco más precisos para saber si es NVIDIA con CUDA
+    # Refinar detección de NVIDIA con CUDA
     is_nvidia_with_cuda = False
     try:
         wmic_out = subprocess.check_output(
@@ -52,7 +52,7 @@ def ensure_optimal_onnx_runtime():
         
         # Si tiene NVIDIA y check_cuda_support dice False, entonces TIENE CUDA (o falló wmic)
         if has_nvidia and not has_nvidia_no_cuda:
-            # Confirmación final de nvcc o CUDA_PATH
+            # Confirmar existencia de nvcc o CUDA_PATH
             cuda_path = os.environ.get("CUDA_PATH", "")
             if (cuda_path and os.path.exists(cuda_path)) or subprocess.call(["nvcc", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW) == 0:
                 is_nvidia_with_cuda = True
@@ -61,14 +61,14 @@ def ensure_optimal_onnx_runtime():
 
     target_package = "onnxruntime-gpu" if is_nvidia_with_cuda else "onnxruntime-directml"
 
-    # 3. Comprobar qué hay instalado
+    # Verificar paquetes instalados
     has_cpu = _is_package_installed("onnxruntime")
     has_dml = _is_package_installed("onnxruntime-directml")
     has_gpu = _is_package_installed("onnxruntime-gpu")
 
     needs_cleanup = False
     
-    # Conflictos: CPU instalado junto a DML/GPU anula la aceleración en Windows casi siempre
+    # Prevenir conflictos (CPU instalado junto a DML anula aceleración)
     if has_cpu and (has_dml or has_gpu):
         needs_cleanup = True
     
@@ -85,11 +85,11 @@ def ensure_optimal_onnx_runtime():
     print(f"[FHVT Auto-Config] Hardware detectado requiere: {target_package}")
     print("[FHVT Auto-Config] Por favor, espera unos instantes. Esto solo ocurrirá una vez...\n")
 
-    # 4. Limpieza drástica para evitar paquetes superpuestos
+    # Limpiar paquetes superpuestos preventivamente
     packages_to_remove = ["onnxruntime", "onnxruntime-directml", "onnxruntime-gpu"]
     _run_pip_command(["uninstall", "-y"] + packages_to_remove)
 
-    # 5. Instalación limpia del paquete objetivo
+    # Instalar limpiamente el paquete objetivo
     print(f"[FHVT Auto-Config] Instalando {target_package}...")
     _run_pip_command(["install", target_package])
     print("[FHVT Auto-Config] ¡Entorno optimizado con éxito! Iniciando aplicación...\n")
